@@ -19,7 +19,7 @@ The verifier checks three named clauses:
 
 ## Coverage & Sync Record
 
-- **Last verified sync commit:** `b4e82b0d8ee98d9f565cff7e9563390c80db5ba1`
+- **Last verified sync commit:** `58c9db26656669e8d03b82de424d7c1a35966609`
 - **Covered files and functions:**
   - `integration-state.ts`:
     - `decideIntegrationAction`
@@ -43,7 +43,7 @@ The verifier checks three named clauses:
 Check whether any covered file changed since the sync commit before trusting a pass:
 
 ```sh
-git diff b4e82b0d8ee98d9f565cff7e9563390c80db5ba1 -- integration-state.ts index.ts layerfs-engine.ts types.ts
+git diff 58c9db26656669e8d03b82de424d7c1a35966609 -- integration-state.ts index.ts layerfs-engine.ts types.ts
 ```
 
 Move the sync commit forward in this `SKILL.md` **only** after you have inspected every diff in those covered files and confirmed that `scripts/verify-wave-integration.ts` accurately models all atomic persistence steps at the new commit.
@@ -61,7 +61,7 @@ node .agents/skills/verify-wave-integration/scripts/verify-wave-integration.ts
 
 ## Current Baseline & Open Findings
 
-At sync commit `b4e82b0d8ee98d9f565cff7e9563390c80db5ba1` (all three clauses **PASS**, exit code `0`; `1,422` reachable states, `2,016` transitions, ~45 ms):
+At sync commit `58c9db26656669e8d03b82de424d7c1a35966609` (all three clauses **PASS**, exit code `0`; `1,422` reachable states, `2,016` transitions, ~45 ms):
 
 - **`NoDoubleMerge`:** **PASS** — `decideIntegrationAction` only returns `"merge"` when `plan.phase === "READY_TO_INTEGRATE"`, no integration record exists, and `store.headLayerId === plan.baseLayerId`.
 - **`NoRecoveryDeadlock`:** **PASS** — `reconcileIntegrationRecord` (`integration-state.ts:70-120`) adopts the store head whenever `headLayerId !== rec.parentLayerId`, even when `rec.publishedLayerId` still points at the wave's own merge Layer (the post-test `importHostAsLayer` window in `orch_integrate`/`orch_retry_integration`), so `rec.publishedLayerId`, `plan.baseLayerId`, and `decide{Retry,Rollback}IntegrationAction` agree on the head.
