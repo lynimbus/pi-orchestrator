@@ -328,6 +328,12 @@ function nextStates(
 			const next = cloneState(s);
 			const waveIdx = next.plan.currentWaveIndex;
 			const parentLayerId = next.plan.baseLayerId || next.headLayerId;
+			// Mirrors `index.ts` orch_integrate: the pre-merge task statuses are captured
+			// when `status: "running"` is persisted, before anything is merged.
+			const statusesBeforeMerge: Record<string, PreMergeTaskStatus> = {};
+			for (const id of next.plan.waves[waveIdx] ?? []) {
+				statusesBeforeMerge[id] = next.plan.tasks[id].state.status as PreMergeTaskStatus;
+			}
 			next.plan.phase = "INTEGRATING";
 			next.plan.integration = {
 				status: "running",
@@ -337,6 +343,7 @@ function nextStates(
 				attempts: 1,
 				parentLayerId,
 				testCommand: next.plan.integrationTestCommand,
+				taskStatusesBeforeMerge: statusesBeforeMerge,
 			};
 			next.inFlightCall = "integrate_started";
 			next.inFlightParentLayerId = parentLayerId;
@@ -397,7 +404,9 @@ function nextStates(
 			merged.plan.tasks[id].state.status = "merged";
 		}
 		merged.plan.baseLayerId = pubId;
-		merged.plan.integration!.taskStatusesBeforeMerge = before;
+		// Mirrors `index.ts` `markWaveMerged`: an already-persisted snapshot is never overwritten.
+		merged.plan.integration!.taskStatusesBeforeMerge =
+			merged.plan.integration!.taskStatusesBeforeMerge ?? before;
 		merged.inFlightCall = "integrate_plan_merged";
 		pushStep(merged, {
 			action: "PersistWaveMergedInPlan",

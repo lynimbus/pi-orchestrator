@@ -17,7 +17,7 @@ import {
 	decideRollbackIntegrationAction,
 	reconcileIntegrationRecord,
 } from "./integration-state.ts";
-import type { OrchestrationPlan } from "./types.ts";
+import type { OrchestrationPlan, TaskStatus } from "./types.ts";
 import { executeWorkspaceCommand } from "./verifier.ts";
 
 let counter = 0;
@@ -516,8 +516,25 @@ function testIntegrationStateMachine() {
 
 /** Crash recovery uses the LayerFS head as the source of truth. */
 function testIntegrationCrashRecovery() {
-	const makePlan = (): OrchestrationPlan =>
-		({
+	const makePlan = (
+		opts: {
+			waves?: string[][];
+			statuses?: Record<string, TaskStatus>;
+			parentLayerId?: string;
+			publishedLayerId?: string;
+			taskStatusesBeforeMerge?: Record<string, TaskStatus>;
+		} = {},
+	): OrchestrationPlan => {
+		const waves = opts.waves ?? [["T1"]];
+		const statuses = opts.statuses ?? { T1: "approved" as TaskStatus };
+		const tasks: Record<string, { spec: unknown; state: { status: TaskStatus } }> = {};
+		for (const wave of waves) {
+			for (const id of wave) {
+				tasks[id] = { spec: {}, state: { status: statuses[id] ?? "approved" } };
+			}
+		}
+		const parentLayerId = opts.parentLayerId ?? "L2";
+		return {
 			planId: "p",
 			goal: "g",
 			createdAt: 0,
@@ -525,22 +542,23 @@ function testIntegrationCrashRecovery() {
 			wave0Files: [],
 			wave0Completed: true,
 			integrationTestCommand: "bash tests/run.sh",
-			waves: [["T1"]],
+			waves,
 			currentWaveIndex: 0,
-			baseLayerId: "L2",
+			baseLayerId: parentLayerId,
 			projectId: "p",
-			tasks: {
-				T1: { spec: {}, state: { status: "approved" } },
-			},
+			tasks,
 			integration: {
 				status: "running",
 				waveIndex: 0,
 				startedAt: 0,
 				updatedAt: 0,
 				attempts: 1,
-				parentLayerId: "L2",
+				parentLayerId,
+				publishedLayerId: opts.publishedLayerId,
+				taskStatusesBeforeMerge: opts.taskStatusesBeforeMerge,
 			},
-		} as unknown as OrchestrationPlan);
+		} as unknown as OrchestrationPlan;
+	};
 
 	// Layer published but the crash happened before `publishedLayerId` was recorded.
 	const p1 = makePlan();
@@ -566,6 +584,95 @@ function testIntegrationCrashRecovery() {
 	p3.phase = "COMPLETED";
 	assert.equal(reconcileIntegrationRecord(p3, "L3"), false);
 	assert.equal(p3.phase, "COMPLETED");
+
+	// ---------------------------------------------------------------------
+	// Finding: RollbackPreservesTaskStatuses
+	// A crash-recovered merge must remember which tasks were escalated before
+	// they were flipped to "merged", so rolling back cannot silently downgrade
+	// them to "approved" (which would drop the Lead Agent's host edits on the
+	// next integrate attempt).
+	// ---------------------------------------------------------------------
+	const p4 = makePlan({
+		waves: [["T1", "T2"]],
+		statuses: { T1: "approved", T2: "escalated" },
+		parentLayerId: "L2",
+	});
+	assert.equal(reconcileIntegrationRecord(p4, "L3"), true);
+	assert.deepEqual(
+		p4.integration?.taskStatusesBeforeMerge,
+		{ T1: "approved", T2: "escalated" },
+		"pre-merge statuses must be captured before tasks are marked merged",
+	);
+	assert.equal(p4.tasks.T1.state.status, "merged");
+	assert.equal(p4.tasks.T2.state.status, "merged");
+	// Same restoration rule as `orch_rollback_integration` (index.ts:1477-1480).
+	assert.equal(p4.integration?.status, "failed");
+	assert.equal(decideRollbackIntegrationAction(p4, "L3").allowed, true);
+	for (const id of p4.waves[0]) {
+		const previous = p4.integration?.taskStatusesBeforeMerge?.[id];
+		p4.tasks[id].state.status = previous === "escalated" ? "escalated" : "approved";
+	}
+	assert.equal(p4.tasks.T1.state.status, "approved");
+	assert.equal(
+		p4.tasks.T2.state.status,
+		"escalated",
+		"rollback after crash recovery must not downgrade an escalated task to approved",
+	);
+
+	// ---------------------------------------------------------------------
+	// Finding: NoRecoveryDeadlock
+	// The integration test mutated tracked host files, so `orch_integrate`
+	// imported the post-test host state as a new Layer (head L4) and the process
+	// died before persisting `publishedLayerId`. Reconcile must adopt the real
+	// head, otherwise retry/rollback stay blocked forever.
+	// ---------------------------------------------------------------------
+	const p5 = makePlan({
+		statuses: { T1: "merged" },
+		parentLayerId: "L2",
+		publishedLayerId: "L3",
+		taskStatusesBeforeMerge: { T1: "escalated" },
+	});
+	assert.equal(reconcileIntegrationRecord(p5, "L4"), true);
+	assert.equal(p5.integration?.publishedLayerId, "L4", "published Layer must follow the store head");
+	assert.equal(p5.baseLayerId, "L4", "plan base must follow the post-test host-sync Layer");
+	assert.equal(p5.phase, "INTEGRATION_FAILED");
+	assert.equal(p5.integration?.status, "failed");
+	assert.equal(p5.tasks.T1.state.status, "merged");
+	assert.deepEqual(
+		p5.integration?.taskStatusesBeforeMerge,
+		{ T1: "escalated" },
+		"an existing pre-merge snapshot must never be overwritten",
+	);
+	assert.equal(decideIntegrationAction(p5, "L4").action, "no-op", "never re-merge the wave");
+	assert.equal(
+		decideRetryIntegrationAction(p5, "L4").allowed,
+		true,
+		"retry must be allowed against the post-test host-sync Layer",
+	);
+	assert.equal(
+		decideRollbackIntegrationAction(p5, "L4").allowed,
+		true,
+		"rollback must be allowed against the post-test host-sync Layer",
+	);
+	assert.equal(
+		decideRetryIntegrationAction(p5, "L3").allowed,
+		false,
+		"the stale pre-test Layer must no longer be considered the head",
+	);
+
+	// Same deadlock, one layer earlier: publishedLayerId L2, post-test sync L3.
+	const p6 = makePlan({
+		statuses: { T1: "merged" },
+		parentLayerId: "L1",
+		publishedLayerId: "L2",
+	});
+	assert.equal(reconcileIntegrationRecord(p6, "L3"), true);
+	assert.equal(p6.integration?.publishedLayerId, "L3");
+	assert.equal(p6.baseLayerId, "L3");
+	assert.equal(p6.phase, "INTEGRATION_FAILED");
+	assert.equal(p6.integration?.taskStatusesBeforeMerge, undefined, "already-merged tasks need no snapshot");
+	assert.equal(decideRetryIntegrationAction(p6, "L3").allowed, true);
+	assert.equal(decideRollbackIntegrationAction(p6, "L3").allowed, true);
 }
 
 /**

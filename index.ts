@@ -1034,7 +1034,13 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			plan.tasks[id].state.status = "merged";
 		}
 		plan.baseLayerId = publishedLayerId;
-		if (plan.integration) plan.integration.taskStatusesBeforeMerge = before;
+		if (plan.integration) {
+			// Never overwrite the snapshot taken when `status: "running"` was persisted: the
+			// statuses read here may already be `"merged"` (e.g. after crash recovery or a
+			// re-entry), which would downgrade an escalated task on rollback.
+			plan.integration.taskStatusesBeforeMerge =
+				plan.integration.taskStatusesBeforeMerge ?? before;
+		}
 	}
 
 	function finalizeWaveAfterPassingTests(
@@ -1177,6 +1183,12 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 
 			// Persist "running" BEFORE publishing anything: a crash can then be recovered
 			// by reconcileIntegrationState instead of allowing a duplicate merge.
+			// The pre-merge task statuses are captured here (not only in `markWaveMerged`)
+			// so a crash-recovered rollback still restores `escalated` vs `approved`.
+			const taskStatusesBeforeMerge: Record<string, TaskStatus> = {};
+			for (const id of currentWaveIds) {
+				taskStatusesBeforeMerge[id] = plan.tasks[id].state.status;
+			}
 			plan.phase = "INTEGRATING";
 			plan.integration = {
 				status: "running",
@@ -1186,6 +1198,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				attempts: 1,
 				parentLayerId,
 				testCommand: plan.integrationTestCommand,
+				taskStatusesBeforeMerge,
 			};
 			persistState();
 			updateUI(ctx);
@@ -1397,6 +1410,33 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			rec.hostMismatches = hostCheck.matches ? [] : hostCheck.mismatches;
 			rec.hostDrift = hostCheck.matches ? [] : hostCheck.mismatches;
 
+			// The retried test command may itself mutate tracked host files (a test that
+			// rewrites fixtures, generates sources, ...). Mirror the post-test host sync of
+			// `orch_integrate`: publish the post-test host state as a Layer so the store head
+			// and `publishedLayerId`/`plan.baseLayerId` stay consistent. Without it the head
+			// would no longer match `publishedLayerId`, permanently blocking both
+			// `orch_retry_integration` and `orch_rollback_integration` (NoRecoveryDeadlock).
+			let postTestSyncWarning = "";
+			const verifyAfterTest = engine.verifyHostMatchesLayer();
+			if (!verifyAfterTest.matches) {
+				const postTestLayer = engine.importHostAsLayer(
+					`Wave ${plan.currentWaveIndex + 1} post-retry host sync`,
+				);
+				plan.baseLayerId = postTestLayer.layerId;
+				rec.publishedLayerId = postTestLayer.layerId;
+				rec.hostMatchesLayer = true;
+				rec.hostMismatches = [];
+				rec.hostDrift = [];
+				postTestSyncWarning = [
+					`\n⚠ The retried integration test modified tracked host files; imported the post-test host state as Layer \`${postTestLayer.layerId}\` (plan base and published Layer updated).`,
+					postTestLayer.treeRegressionWarning
+						? `⚠ ${postTestLayer.treeRegressionWarning}`
+						: "",
+				]
+					.filter(Boolean)
+					.join("\n");
+			}
+
 			if (result.exitCode !== 0) {
 				rec.status = "failed";
 				rec.testDiagnostics = formatCommandDiagnostics(result);
@@ -1411,12 +1451,15 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 							text: [
 								`⚠ Integration test retry #${rec.attempts} FAILED (exit ${result.exitCode}). No merge or publish was performed.`,
 								`- Published Layer: \`${rec.publishedLayerId}\` (unchanged)`,
-								`- Host <-> Layer: ${hostCheck.matches ? "MATCH" : `MISMATCH (${hostCheck.mismatches.slice(0, 5).join(", ")})`}`,
+								`- Host <-> Layer: ${rec.hostMatchesLayer ? "MATCH" : `MISMATCH (${(rec.hostMismatches ?? []).slice(0, 5).join(", ")})`}`,
+								postTestSyncWarning,
 								"",
 								formatCommandDiagnostics(result),
 								"",
 								"Next: `orch_retry_integration` again, `orch_rollback_integration`, or `/orch reset` + a new plan.",
-							].join("\n"),
+							]
+								.filter(Boolean)
+								.join("\n"),
 						},
 					],
 					isError: true,
@@ -1426,7 +1469,11 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			rec.testDiagnostics = undefined;
 			return {
 				content: [
-					{ type: "text", text: finalizeWaveAfterPassingTests(result, ctx, true) },
+					{
+						type: "text",
+						text:
+							finalizeWaveAfterPassingTests(result, ctx, true) + postTestSyncWarning,
+					},
 				],
 			};
 		},

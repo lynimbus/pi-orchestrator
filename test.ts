@@ -6,6 +6,299 @@ import { LayerFSEngine } from "./layerfs-engine.ts";
 import type { TaskSpec } from "./types.ts";
 import { runMechanicalVerificationGate } from "./verifier.ts";
 
+const STORE_ROOT = path.join(os.homedir(), ".pi", "agent", "orchestrator-layerfs");
+
+interface Sandbox {
+	hostDir: string;
+	projectId: string;
+	engine: LayerFSEngine;
+	cleanup: () => void;
+}
+
+async function createSandbox(tag: string, files: Record<string, string>): Promise<Sandbox> {
+	const hostDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), `orch-${tag}-host-`));
+	for (const [relPath, content] of Object.entries(files)) {
+		const full = path.join(hostDir, relPath);
+		fs.mkdirSync(path.dirname(full), { recursive: true });
+		fs.writeFileSync(full, content, "utf-8");
+	}
+	const projectId = `test-${tag}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+	const engine = new LayerFSEngine(hostDir, projectId);
+	return {
+		hostDir,
+		projectId,
+		engine,
+		cleanup: () => {
+			fs.rmSync(hostDir, { recursive: true, force: true });
+			fs.rmSync(path.join(STORE_ROOT, projectId), { recursive: true, force: true });
+		},
+	};
+}
+
+/** Imports the host as L1, forks one branch per edit and commits `relPath` with the given text. */
+async function buildLineMergeWave(
+	tag: string,
+	relPath: string,
+	baseText: string,
+	branchEdits: Record<string, string>,
+): Promise<Sandbox> {
+	const sandbox = await createSandbox(tag, { [relPath]: baseText });
+	sandbox.engine.importHostAsLayer("base import");
+	for (const [branchName, text] of Object.entries(branchEdits)) {
+		sandbox.engine.forkBranch(branchName, "L1");
+		const ws = sandbox.engine.mountWorkspace(branchName);
+		fs.writeFileSync(path.join(ws.workspacePath, relPath), text, "utf-8");
+		sandbox.engine.commitWorkspace(branchName, `edit ${relPath} on ${branchName}`);
+	}
+	return sandbox;
+}
+
+/**
+ * Acceptance criterion 3: 3 branches making disjoint edits must merge cleanly in ANY branch order
+ * and always produce `B\nA\nX\nC`.
+ */
+async function testMultiBranchDisjointLineMergeIsOrderIndependent() {
+	const baseText = "A\nB\nC";
+	const edits = {
+		"task-t1": "B\nA\nB\nC", // insert "B" at 0..0
+		"task-t2": "A\nC", // delete "B" at 1..2
+		"task-t3": "A\nB\nX\nC", // insert "X" at 2..2
+	};
+	const orders = [
+		["task-t1", "task-t2", "task-t3"],
+		["task-t1", "task-t3", "task-t2"],
+		["task-t3", "task-t2", "task-t1"],
+	];
+
+	for (const order of orders) {
+		const sandbox = await buildLineMergeWave(
+			`t2-disjoint-${order.join("_")}`,
+			"shared.txt",
+			baseText,
+			edits,
+		);
+		try {
+			const result = sandbox.engine.mergeAndPublishWave(order, {
+				allowAutoThreeWayLineMerge: true,
+				message: `disjoint merge ${order.join(",")}`,
+			});
+			assert.equal(
+				result.ok,
+				true,
+				`3-branch disjoint merge must succeed for order [${order.join(", ")}], got: ${JSON.stringify(result.conflicts)}`,
+			);
+			assert.deepEqual(result.conflicts, [], "disjoint merge must not report conflicts");
+			assert.ok(result.publishedLayerId, "disjoint merge must publish a layer");
+
+			const mergedOnHost = fs.readFileSync(path.join(sandbox.hostDir, "shared.txt"), "utf-8");
+			assert.equal(
+				mergedOnHost,
+				"B\nA\nX\nC",
+				`3-branch disjoint merge must publish 'B\\nA\\nX\\nC' for order [${order.join(", ")}]`,
+			);
+
+			const publishedLayer = sandbox.engine.loadLayer(result.publishedLayerId!);
+			const publishedEntry = publishedLayer.tree["shared.txt"];
+			assert.ok(publishedEntry, "published layer must contain shared.txt");
+			const publishedText = sandbox.engine
+				.readCanonicalBlob(publishedEntry.objectId)
+				.toString("utf-8");
+			assert.equal(
+				publishedText,
+				"B\nA\nX\nC",
+				`published layer blob must be 'B\\nA\\nX\\nC' for order [${order.join(", ")}]`,
+			);
+		} finally {
+			sandbox.cleanup();
+		}
+	}
+}
+
+/**
+ * Acceptance criteria 1 & 2: a delete/modify conflict on the same base line must be reported for
+ * EVERY branch order (and never silently collapse into `B2\nA\nC`).
+ */
+async function testMultiBranchDeleteModifyConflictIsOrderIndependent() {
+	const baseText = "A\nB\nC";
+	const edits = {
+		"task-t1": "B\nA\nB\nC", // insert "B" at 0..0
+		"task-t2": "A\nC", // delete "B" at 1..2
+		"task-t3": "A\nB2\nC", // modify "B" -> "B2" at 1..2
+	};
+	const orders = [
+		["task-t1", "task-t2", "task-t3"],
+		["task-t2", "task-t3", "task-t1"],
+		["task-t3", "task-t1", "task-t2"],
+	];
+
+	for (const order of orders) {
+		const sandbox = await buildLineMergeWave(
+			`t2-conflict-${order.join("_")}`,
+			"shared.txt",
+			baseText,
+			edits,
+		);
+		try {
+			const result = sandbox.engine.mergeAndPublishWave(order, {
+				allowAutoThreeWayLineMerge: true,
+				message: `conflicting merge ${order.join(",")}`,
+			});
+			assert.equal(
+				result.ok,
+				false,
+				`delete/modify conflict must be reported for order [${order.join(", ")}]`,
+			);
+			assert.equal(result.publishedLayerId, undefined, "conflicting merge must not publish a layer");
+			assert.ok(result.conflicts.length > 0, "conflicting merge must report at least one conflict");
+			const conflict = result.conflicts.find((c) => c.path === "shared.txt");
+			assert.ok(conflict, `conflict must be reported on shared.txt for order [${order.join(", ")}]`);
+			assert.match(conflict!.reason, /Overlapping line modifications/);
+
+			// Host must be untouched (no silent corruption to 'B2\nA\nC' / 'B\nA\nC').
+			const hostText = fs.readFileSync(path.join(sandbox.hostDir, "shared.txt"), "utf-8");
+			assert.equal(hostText, baseText, "conflicting merge must leave the host file untouched");
+		} finally {
+			sandbox.cleanup();
+		}
+	}
+}
+
+/**
+ * Acceptance criterion 4: a mode-only change (chmod +x, identical bytes) must be detected and
+ * published to the new layer and to the host file mode.
+ */
+async function testModeOnlyChangeIsMergedAndPublished() {
+	const content = "#!/bin/sh\necho hi\n";
+
+	// (a) single-branch mode-only change
+	{
+		const sandbox = await createSandbox("t2-mode-single", { "script.sh": content });
+		try {
+			fs.chmodSync(path.join(sandbox.hostDir, "script.sh"), 0o644);
+			const baseLayer = sandbox.engine.importHostAsLayer("base import");
+			assert.equal(baseLayer.tree["script.sh"].mode, 0o644, "base entry mode must be 0o644");
+
+			sandbox.engine.forkBranch("task-mode", "L1");
+			const ws = sandbox.engine.mountWorkspace("task-mode");
+			const workspaceFile = path.join(ws.workspacePath, "script.sh");
+			// chmod only: byte contents stay identical
+			fs.chmodSync(workspaceFile, 0o755);
+			assert.equal(fs.readFileSync(workspaceFile, "utf-8"), content);
+			sandbox.engine.commitWorkspace("task-mode", "chmod +x script.sh");
+
+			const result = sandbox.engine.mergeAndPublishWave(["task-mode"], {
+				allowAutoThreeWayLineMerge: true,
+				message: "mode-only merge",
+			});
+			assert.equal(result.ok, true, `mode-only merge must succeed: ${result.error ?? ""}`);
+			const published = sandbox.engine.loadLayer(result.publishedLayerId!);
+			const entry = published.tree["script.sh"];
+			assert.ok(entry, "published layer must still contain script.sh");
+			assert.equal(entry.mode, 0o755, "published layer entry must record mode 0o755");
+			assert.equal(
+				entry.objectId,
+				baseLayer.tree["script.sh"].objectId,
+				"mode-only change must keep the same content objectId",
+			);
+			const hostMode = fs.statSync(path.join(sandbox.hostDir, "script.sh")).mode & 0o777;
+			assert.equal(hostMode, 0o755, "host file mode must be updated to 0o755");
+			assert.equal(
+				fs.readFileSync(path.join(sandbox.hostDir, "script.sh"), "utf-8"),
+				content,
+				"host file content must be preserved",
+			);
+		} finally {
+			sandbox.cleanup();
+		}
+	}
+
+	// (b) multi-branch: one branch chmods, another edits the bytes -> mode must survive
+	const multiBranchOrders = [
+		["task-mode", "task-edit"],
+		["task-edit", "task-mode"],
+	];
+	for (const order of multiBranchOrders) {
+		const sandbox = await createSandbox(`t2-mode-multi-${order.join("_")}`, {
+			"script.sh": content,
+		});
+		try {
+			fs.chmodSync(path.join(sandbox.hostDir, "script.sh"), 0o644);
+			const baseLayer = sandbox.engine.importHostAsLayer("base import");
+			assert.equal(baseLayer.tree["script.sh"].mode, 0o644);
+
+			sandbox.engine.forkBranch("task-mode", "L1");
+			sandbox.engine.forkBranch("task-edit", "L1");
+			const wsMode = sandbox.engine.mountWorkspace("task-mode");
+			const wsEdit = sandbox.engine.mountWorkspace("task-edit");
+
+			// Mode-only touch on branch 1
+			fs.chmodSync(path.join(wsMode.workspacePath, "script.sh"), 0o755);
+			sandbox.engine.commitWorkspace("task-mode", "chmod +x script.sh");
+
+			// Content-only touch on branch 2 (keeps 0o644)
+			fs.writeFileSync(
+				path.join(wsEdit.workspacePath, "script.sh"),
+				"#!/bin/sh\necho bye\n",
+				"utf-8",
+			);
+			sandbox.engine.commitWorkspace("task-edit", "change greeting");
+
+			const result = sandbox.engine.mergeAndPublishWave(order, {
+				allowAutoThreeWayLineMerge: true,
+				message: `mode + content merge ${order.join(",")}`,
+			});
+			assert.equal(
+				result.ok,
+				true,
+				`mode+content merge must succeed for order [${order.join(", ")}]: ${result.error ?? ""}`,
+			);
+			assert.deepEqual(result.conflicts, []);
+			const published = sandbox.engine.loadLayer(result.publishedLayerId!);
+			const entry = published.tree["script.sh"];
+			assert.ok(entry, "published layer must contain script.sh");
+			assert.equal(entry.mode, 0o755, "multi-branch merge must preserve the 0o755 mode change");
+			assert.equal(
+				sandbox.engine.readCanonicalBlob(entry.objectId).toString("utf-8"),
+				"#!/bin/sh\necho bye\n",
+				"multi-branch merge must keep the edited content",
+			);
+			const hostMode = fs.statSync(path.join(sandbox.hostDir, "script.sh")).mode & 0o777;
+			assert.equal(hostMode, 0o755, "host mode must stay 0o755 after the merged wave");
+		} finally {
+			sandbox.cleanup();
+		}
+	}
+
+	// (c) both branches only chmod -> convergent entry with mode 0o755
+	{
+		const sandbox = await createSandbox("t2-mode-both", { "script.sh": content });
+		try {
+			fs.chmodSync(path.join(sandbox.hostDir, "script.sh"), 0o644);
+			sandbox.engine.importHostAsLayer("base import");
+			for (const branchName of ["task-mode-a", "task-mode-b"]) {
+				sandbox.engine.forkBranch(branchName, "L1");
+				const ws = sandbox.engine.mountWorkspace(branchName);
+				fs.chmodSync(path.join(ws.workspacePath, "script.sh"), 0o755);
+				sandbox.engine.commitWorkspace(branchName, `chmod +x on ${branchName}`);
+			}
+			const result = sandbox.engine.mergeAndPublishWave(["task-mode-a", "task-mode-b"], {
+				allowAutoThreeWayLineMerge: true,
+				message: "convergent mode-only merge",
+			});
+			assert.equal(result.ok, true, `convergent mode merge must succeed: ${result.error ?? ""}`);
+			const published = sandbox.engine.loadLayer(result.publishedLayerId!);
+			assert.equal(published.tree["script.sh"].mode, 0o755);
+			assert.equal(
+				fs.statSync(path.join(sandbox.hostDir, "script.sh")).mode & 0o777,
+				0o755,
+				"host mode must be 0o755 after a convergent mode-only wave merge",
+			);
+		} finally {
+			sandbox.cleanup();
+		}
+	}
+}
+
 async function runTests() {
 	const tmpHost = await fs.promises.mkdtemp(path.join(os.tmpdir(), "orch-test-host-"));
 	const testProjectId = `test-proj-${Date.now()}`;
@@ -229,6 +522,11 @@ async function runTests() {
 		const mergedMath = fs.readFileSync(path.join(tmpHost, "src", "math.js"), "utf-8");
 		assert.match(mergedMath, /Number\(a\) \+ Number\(b\)/);
 		assert.match(mergedMath, /Number\(a\) - Number\(b\)/);
+
+		// T2 regressions: N-way line merge order independence, conflict soundness, mode-only touches.
+		await testMultiBranchDisjointLineMergeIsOrderIndependent();
+		await testMultiBranchDeleteModifyConflictIsOrderIndependent();
+		await testModeOnlyChangeIsMergedAndPublished();
 
 		console.log("ALL LAYERFS ENGINE & MECHANICAL GATE TESTS PASSED!");
 	} finally {

@@ -5,7 +5,7 @@
  * never be merged twice) can be covered by deterministic unit tests.
  */
 
-import type { OrchestrationPlan } from "./types.ts";
+import type { OrchestrationPlan, TaskStatus } from "./types.ts";
 
 export type IntegrationDecision =
 	| { action: "merge"; reason: string }
@@ -72,35 +72,50 @@ export function reconcileIntegrationRecord(
 ): boolean {
 	const rec = plan.integration;
 	if (!rec || rec.status !== "running") return false;
-	// If the head advanced beyond the pre-merge parent, a Layer was published even
-	// if the process died before recording `publishedLayerId`.
-	const published =
-		rec.publishedLayerId ??
-		(headLayerId !== rec.parentLayerId ? headLayerId : undefined);
 
-	if (published && headLayerId === published) {
-		for (const id of plan.waves[rec.waveIndex] ?? []) {
-			const task = plan.tasks[id];
-			if (task && task.state.status !== "merged") task.state.status = "merged";
-		}
-		plan.baseLayerId = published;
-		rec.publishedLayerId = published;
-		rec.status = "failed";
-		rec.lastError =
-			"Integration was interrupted after the Layer was published; the test result is unknown.";
-		rec.updatedAt = Date.now();
-		plan.phase = "INTEGRATION_FAILED";
-		return true;
-	}
 	if (headLayerId === rec.parentLayerId) {
 		// Nothing was published: safe to attempt the merge again.
 		plan.integration = undefined;
 		plan.phase = "READY_TO_INTEGRATE";
 		return true;
 	}
+
+	if (!headLayerId) {
+		rec.status = "failed";
+		rec.lastError = `Store head is empty while the integration record expects a Layer published from ${rec.parentLayerId}; refusing to merge again.`;
+		rec.updatedAt = Date.now();
+		plan.phase = "INTEGRATION_FAILED";
+		return true;
+	}
+
+	// The head advanced past the pre-merge parent, so a Layer WAS published even if
+	// the process died before `persistState()` recorded `publishedLayerId`. This also
+	// covers the post-test host sync (`importHostAsLayer` in `orch_integrate` /
+	// `orch_retry_integration`), which publishes one more Layer on top of the wave
+	// Layer: the store head is then the real, latest Layer and MUST become
+	// `publishedLayerId`/`plan.baseLayerId`, otherwise retry and rollback stay
+	// blocked forever (`NoRecoveryDeadlock`).
+	const waveIds = plan.waves[rec.waveIndex] ?? [];
+	if (!rec.taskStatusesBeforeMerge) {
+		// Snapshot the pre-merge statuses BEFORE flipping tasks to "merged" so a later
+		// rollback can restore `escalated` (and keep `includeHostEdits: true`).
+		const before: Record<string, TaskStatus> = {};
+		for (const id of waveIds) {
+			const task = plan.tasks[id];
+			if (task && task.state.status !== "merged") before[id] = task.state.status;
+		}
+		if (Object.keys(before).length > 0) rec.taskStatusesBeforeMerge = before;
+	}
+	for (const id of waveIds) {
+		const task = plan.tasks[id];
+		if (task) task.state.status = "merged";
+	}
+	plan.baseLayerId = headLayerId;
+	rec.publishedLayerId = headLayerId;
 	rec.status = "failed";
-	rec.publishedLayerId = rec.publishedLayerId ?? headLayerId;
-	rec.lastError = `Store head (${headLayerId}) diverged from the integration record; refusing to merge again.`;
+	rec.lastError =
+		rec.lastError ??
+		"Process exited while integration test was running; Layer was already published.";
 	rec.updatedAt = Date.now();
 	plan.phase = "INTEGRATION_FAILED";
 	return true;

@@ -19,7 +19,7 @@ The verifier checks three named clauses:
 
 ## Coverage & Sync Record
 
-- **Last verified sync commit:** `d4ce230a56c1475dd3d647cb518d09bb5abfb0ce`
+- **Last verified sync commit:** `b4e82b0d8ee98d9f565cff7e9563390c80db5ba1`
 - **Covered files and functions:**
   - `integration-state.ts`:
     - `decideIntegrationAction`
@@ -43,7 +43,7 @@ The verifier checks three named clauses:
 Check whether any covered file changed since the sync commit before trusting a pass:
 
 ```sh
-git diff d4ce230a56c1475dd3d647cb518d09bb5abfb0ce -- integration-state.ts index.ts layerfs-engine.ts types.ts
+git diff b4e82b0d8ee98d9f565cff7e9563390c80db5ba1 -- integration-state.ts index.ts layerfs-engine.ts types.ts
 ```
 
 Move the sync commit forward in this `SKILL.md` **only** after you have inspected every diff in those covered files and confirmed that `scripts/verify-wave-integration.ts` accurately models all atomic persistence steps at the new commit.
@@ -57,14 +57,17 @@ node .agents/skills/verify-wave-integration/scripts/verify-wave-integration.ts
 ```
 
 - **Runtime:** ~40–60 ms (Node.js native TypeScript execution, zero external dependencies).
-- **Bounds:** `waves <= 2`, `tasks per wave <= 2` (`approved` and `escalated` combinations), `crashes <= 2`, `rollbacks <= 2`, `layerSequence <= 6` (1,821 reachable states, 2,414 transitions).
+- **Bounds:** `waves <= 2`, `tasks per wave <= 2` (`approved` and `escalated` combinations), `crashes <= 2`, `rollbacks <= 2`, `layerSequence <= 6`.
 
-## Current Baseline & Open Findings at Sync Commit
+## Current Baseline & Open Findings
 
-At commit `d4ce230a56c1475dd3d647cb518d09bb5abfb0ce`:
-- **`NoDoubleMerge`:** **PASS** across all 1,821 reachable states.
-- **`NoRecoveryDeadlock`:** **FAIL (Open Finding 1)** — In `index.ts:1251-1255`, `orch_integrate` persists `rec.publishedLayerId = "L2"`. If the integration test modifies tracked host files (`!verifyAfterTest.matches` at `index.ts:1299`), `engine.importHostAsLayer` (`index.ts:1301`) advances the LayerFS store `headLayerId` to `"L3"` before `index.ts:1305` persists `rec.publishedLayerId = "L3"`. If the process crashes in that window and `reconcileIntegrationRecord(plan, "L3")` (`integration-state.ts:64-101`) runs on restart, line 70 sets `published = rec.publishedLayerId ?? ...` (`"L2"`), misses the `headLayerId === published` branch, and line 96 runs `rec.publishedLayerId = rec.publishedLayerId ?? headLayerId` which keeps `"L2"` instead of updating to `"L3"`. With `headLayerId = "L3"` and `rec.publishedLayerId = "L2"`, `decideRetryIntegrationAction`, `decideRollbackIntegrationAction`, and `decideIntegrationAction` all refuse to run.
-- **`RollbackPreservesTaskStatuses`:** **FAIL (Open Finding 2)** — If the process crashes after `mergeAndPublishWave` updates `headLayerId = "L2"` (`layerfs-engine.ts:1166`) before `markWaveMerged` (`index.ts:1030-1039`) persists `rec.taskStatusesBeforeMerge`, `reconcileIntegrationRecord(plan, "L2")` (`integration-state.ts:74-77`) overwrites every wave task's `state.status` to `"merged"` without recording `rec.taskStatusesBeforeMerge`. When `orch_rollback_integration` (`index.ts:1475-1481`) subsequently rolls back the wave, `before[id] ?? "approved"` turns any `"escalated"` task into `"approved"`.
+At sync commit `b4e82b0d8ee98d9f565cff7e9563390c80db5ba1` (all three clauses **PASS**, exit code `0`; `1,422` reachable states, `2,016` transitions, ~45 ms):
+
+- **`NoDoubleMerge`:** **PASS** — `decideIntegrationAction` only returns `"merge"` when `plan.phase === "READY_TO_INTEGRATE"`, no integration record exists, and `store.headLayerId === plan.baseLayerId`.
+- **`NoRecoveryDeadlock`:** **PASS** — `reconcileIntegrationRecord` (`integration-state.ts:70-120`) adopts the store head whenever `headLayerId !== rec.parentLayerId`, even when `rec.publishedLayerId` still points at the wave's own merge Layer (the post-test `importHostAsLayer` window in `orch_integrate`/`orch_retry_integration`), so `rec.publishedLayerId`, `plan.baseLayerId`, and `decide{Retry,Rollback}IntegrationAction` agree on the head.
+- **`RollbackPreservesTaskStatuses`:** **PASS** — the pre-merge statuses are captured twice and never overwritten: `orch_integrate` writes `taskStatusesBeforeMerge` when it persists `status: "running"` (`index.ts:1183-1201`), `markWaveMerged` keeps an existing snapshot (`index.ts:1037-1043`), and `reconcileIntegrationRecord` captures them before flipping tasks to `"merged"` after a crash, so `orch_rollback_integration` restores `"escalated"` instead of downgrading it to `"approved"`.
+
+No open findings at the sync commit.
 
 ## Interpreting Results: Real Bug vs. Modeling Error
 
@@ -86,6 +89,7 @@ When a change to `integration-state.ts`, `index.ts`, or `layerfs-engine.ts` alte
 ## Scope & What Is Not Covered
 
 - **Covered:** The control-plane protocol between `OrchestrationPlan` persistence (`index.ts`), pure decision/reconciliation logic (`integration-state.ts`), and LayerFS `headLayerId` advancement/rollback (`layerfs-engine.ts`) up to 2 waves, 2 tasks per wave, 2 crashes, and 2 rollbacks.
+  - **Not covered by this check:** `multiWayMergeText` / `threeWayMergeText` hunk arithmetic, `withMergedMode` mode propagation, and the nanosecond stat cache (`statCacheHit`) in `layerfs-engine.ts`. A change to line-merge or mode semantics is caught by `test.ts`, not by this verifier.
 - **Not covered:**
   - Multi-branch 3-way text merge line-hunk computation (`threeWayMergeText` and `mergeAndPublishWave` in `layerfs-engine.ts`).
   - Filesystem inode/stat-cache fingerprinting (`statCacheHit` in `layerfs-engine.ts`) and OS-level `fs.renameSync` crash atomicity.

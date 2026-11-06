@@ -1015,7 +1015,18 @@ export class LayerFSEngine {
 			for (const relPath of candidatePaths) {
 				const forkEntry = contributor.forkBaseTree[relPath];
 				const nextEntry = contributor.headTree[relPath];
-				if (forkEntry?.objectId === nextEntry?.objectId) continue;
+				// `objectId` only hashes file CONTENT bytes, so a branch that only flips the
+				// executable bit or rewrites a symlink target must still count as a touch.
+				if (
+					forkEntry &&
+					nextEntry &&
+					forkEntry.objectId === nextEntry.objectId &&
+					forkEntry.mode === nextEntry.mode &&
+					forkEntry.type === nextEntry.type &&
+					forkEntry.symlinkTarget === nextEntry.symlinkTarget
+				) {
+					continue;
+				}
 				if (!forkEntry && !nextEntry) continue;
 
 				const list = pathTouchMap.get(relPath) ?? [];
@@ -1071,7 +1082,7 @@ export class LayerFSEngine {
 						fromBranches: touches.map((t) => t.branchName),
 					});
 				} else {
-					mergedTree[relPath] = firstEntry;
+					mergedTree[relPath] = withMergedMode(baseEntry, firstEntry, touches);
 					mergedFiles.push({
 						path: relPath,
 						changeType: baseEntry ? "modified" : "added",
@@ -1088,28 +1099,20 @@ export class LayerFSEngine {
 
 			if (options.allowAutoThreeWayLineMerge && allRegularFiles && baseEntry) {
 				const baseText = this.readTextSafe(baseEntry.objectId);
-				let currentMergedText = baseText;
-				let lineMergeFailed = false;
-				let conflictPreview = "";
+				// Merge every branch hunk directly against `baseText` (never against an
+				// already-merged intermediate text) so the result is order independent.
+				const mergeAttempt = multiWayMergeText(
+					baseText,
+					touches.map((t) => this.readTextSafe(t.entry!.objectId)),
+				);
 
-				for (const touch of touches) {
-					const branchText = this.readTextSafe(touch.entry!.objectId);
-					const mergeAttempt = threeWayMergeText(baseText, currentMergedText, branchText);
-					if (!mergeAttempt.ok) {
-						lineMergeFailed = true;
-						conflictPreview = mergeAttempt.conflictPreview || "Overlapping line edits";
-						break;
-					}
-					currentMergedText = mergeAttempt.mergedText;
-				}
-
-				if (!lineMergeFailed) {
-					const mergedBuf = Buffer.from(currentMergedText, "utf-8");
+				if (mergeAttempt.ok) {
+					const mergedBuf = Buffer.from(mergeAttempt.mergedText, "utf-8");
 					const newObjectId = this.writeCanonicalBlob(mergedBuf, meta);
 					mergedTree[relPath] = {
 						type: "file",
 						objectId: newObjectId,
-						mode: touches[0].entry!.mode,
+						mode: resolveMergedMode(baseEntry, touches),
 						size: mergedBuf.byteLength,
 					};
 					mergedFiles.push({
@@ -1129,7 +1132,7 @@ export class LayerFSEngine {
 					reason: "Overlapping line modifications in parallel branches",
 					baseObjectId: baseEntry.objectId,
 					branchObjectIds,
-					conflictPreview,
+					conflictPreview: mergeAttempt.conflictPreview || "Overlapping line edits",
 				});
 				continue;
 			}
@@ -1992,59 +1995,110 @@ function extractHunks(baseLines: string[], targetLines: string[]): PatchHunk[] {
 }
 
 /**
- * Deterministic 3-way text merge for disjoint hunks relative to `baseText`.
+ * Resolve the merged `mode` when several branches touch the same path.
+ *
+ * `objectId` only covers the content bytes, so a branch that only flips the executable
+ * bit (`0o644` -> `0o755`) shares the base objectId with every other branch touch. The
+ * mode therefore has to be merged separately from the content.
  */
-function threeWayMergeText(
+function resolveMergedMode(
+	baseEntry: TreeEntry | undefined,
+	touches: Array<{ entry: TreeEntry | undefined }>,
+): number {
+	const entries = touches
+		.map((t) => t.entry)
+		.filter((entry): entry is TreeEntry => Boolean(entry));
+	if (entries.length === 0) return baseEntry?.mode ?? 0o100644;
+
+	if (baseEntry && entries.some((entry) => entry.mode !== baseEntry.mode)) {
+		// Some contributor changed the mode: prefer the executable mode when present
+		// (an executable bit is safe to converge on), else take the first change.
+		const executable = entries.find((entry) => entry.mode === 0o755);
+		return executable ? executable.mode : entries[0].mode;
+	}
+	return entries[0].mode;
+}
+
+/** `firstEntry` with the merged mode applied (returns the same object when unchanged). */
+function withMergedMode(
+	baseEntry: TreeEntry | undefined,
+	firstEntry: TreeEntry,
+	touches: Array<{ entry: TreeEntry | undefined }>,
+): TreeEntry {
+	const mode = resolveMergedMode(baseEntry, touches);
+	return mode === firstEntry.mode ? firstEntry : { ...firstEntry, mode };
+}
+
+/**
+ * Deterministic N-way text merge for disjoint hunks relative to `baseText`.
+ *
+ * Every branch is diffed DIRECTLY against `baseText` and all hunks are combined in one
+ * pass. Re-diffing an already merged intermediate text against the base (the old
+ * pairwise fold) misidentifies unchanged lines and corrupts hunk boundaries as soon as
+ * three branches edit the same file, making the merge order dependent.
+ */
+function multiWayMergeText(
 	baseText: string,
-	oursText: string,
-	theirsText: string,
+	branchTexts: string[],
 ): { ok: boolean; mergedText: string; conflictPreview?: string } {
-	if (oursText === theirsText) return { ok: true, mergedText: oursText };
-	if (oursText === baseText) return { ok: true, mergedText: theirsText };
-	if (theirsText === baseText) return { ok: true, mergedText: oursText };
+	const distinct: string[] = [];
+	for (const text of branchTexts) {
+		if (text === baseText) continue;
+		if (distinct.includes(text)) continue;
+		distinct.push(text);
+	}
+
+	if (distinct.length === 0) return { ok: true, mergedText: baseText };
+	if (distinct.length === 1) return { ok: true, mergedText: distinct[0] };
 
 	const baseLines = baseText.split("\n");
-	const oursLines = oursText.split("\n");
-	const theirsLines = theirsText.split("\n");
+	const combined: Array<PatchHunk & { branchIndex: number }> = [];
+	distinct.forEach((text, branchIndex) => {
+		for (const hunk of extractHunks(baseLines, text.split("\n"))) {
+			combined.push({ ...hunk, branchIndex });
+		}
+	});
 
-	const oursHunks = extractHunks(baseLines, oursLines);
-	const theirsHunks = extractHunks(baseLines, theirsLines);
+	combined.sort(
+		(a, b) =>
+			a.baseStart - b.baseStart ||
+			a.baseEnd - b.baseEnd ||
+			a.replacement.join("\n").localeCompare(b.replacement.join("\n")),
+	);
 
-	const combined: Array<PatchHunk & { side: "ours" | "theirs" }> = [
-		...oursHunks.map((h) => ({ ...h, side: "ours" as const })),
-		...theirsHunks.map((h) => ({ ...h, side: "theirs" as const })),
-	].sort((a, b) => a.baseStart - b.baseStart || a.baseEnd - b.baseEnd);
-
-	const mergedHunks: PatchHunk[] = [];
-	for (let i = 0; i < combined.length; i++) {
-		const curr = combined[i];
+	const mergedHunks: Array<PatchHunk & { branchIndex: number }> = [];
+	for (const curr of combined) {
 		if (mergedHunks.length === 0) {
 			mergedHunks.push(curr);
 			continue;
 		}
 		const prev = mergedHunks[mergedHunks.length - 1];
+
+		// Convergent identical hunk across branches: keep a single copy.
+		const identical =
+			curr.baseStart === prev.baseStart &&
+			curr.baseEnd === prev.baseEnd &&
+			curr.replacement.length === prev.replacement.length &&
+			curr.replacement.every((line, idx) => line === prev.replacement[idx]);
+		if (identical) continue;
+
+		// A pure insertion immediately BEFORE a modified/deleted range does not overlap:
+		// the insertion's baseEnd equals the other hunk's baseStart, so applying the
+		// insertion first then the replacement is unambiguous.
 		const overlaps =
 			curr.baseStart < prev.baseEnd ||
 			(curr.baseStart === prev.baseStart && curr.baseEnd === prev.baseEnd);
 
 		if (overlaps) {
-			// Identical hunk on both sides is safe
-			if (
-				curr.baseStart === prev.baseStart &&
-				curr.baseEnd === prev.baseEnd &&
-				curr.replacement.join("\n") === prev.replacement.join("\n")
-			) {
-				continue;
-			}
 			return {
 				ok: false,
 				mergedText: "",
 				conflictPreview: [
-					`<<<<<<< ours (lines ${prev.baseStart + 1}-${prev.baseEnd})`,
+					`<<<<<<< branch ${prev.branchIndex + 1} (lines ${prev.baseStart + 1}-${prev.baseEnd})`,
 					prev.replacement.join("\n"),
 					"=======",
 					curr.replacement.join("\n"),
-					`>>>>>>> theirs (lines ${curr.baseStart + 1}-${curr.baseEnd})`,
+					`>>>>>>> branch ${curr.branchIndex + 1} (lines ${curr.baseStart + 1}-${curr.baseEnd})`,
 				].join("\n"),
 			};
 		}
@@ -2065,4 +2119,15 @@ function threeWayMergeText(
 	}
 
 	return { ok: true, mergedText: out.join("\n") };
+}
+
+/**
+ * Deterministic 3-way text merge for disjoint hunks relative to `baseText`.
+ */
+function threeWayMergeText(
+	baseText: string,
+	oursText: string,
+	theirsText: string,
+): { ok: boolean; mergedText: string; conflictPreview?: string } {
+	return multiWayMergeText(baseText, [oursText, theirsText]);
 }
