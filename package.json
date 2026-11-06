@@ -6,7 +6,7 @@
   "license": "MIT",
   "main": "./index.ts",
   "scripts": {
-    "test": "node ./test.ts && node ./test-regressions.ts"
+    "test": "node ./test.ts && node ./test-regressions.ts && node ./test-waves.ts"
   },
   "pi": {
     "extensions": [

@@ -248,6 +248,8 @@ export interface WaveMergeResult {
 	hostDrift?: string[];
 	/** Id of the host pre-image snapshot usable by `rollbackPublishedLayer` */
 	rollbackSnapshotId?: string;
+	/** Set when the published wave layer loses files relative to its parent layer */
+	treeRegressionWarning?: string;
 	mergedFiles: Array<{
 		path: string;
 		changeType: "added" | "modified" | "deleted";

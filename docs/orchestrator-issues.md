@@ -275,6 +275,6 @@ spawn("bash", ["-c", command], {
 3. 覆盖已有文件时 `writeFileSync({mode})` 不会改变已有文件权限，**可执行位丢失**；发布后未做 host ↔ layer 校验；`applyDelta` 会对真实目录执行 `symlinkSync` / 非递归删除而抛错。均已修复（显式 chmod、严格校验、拒绝危险目标、路径穿越防护）。
 4. `orch_plan` 在已有活动 plan 时会静默覆盖状态并重新导入宿主；`orch_review` / `orch_dispatch` 缺少阶段校验，可能在合并后把 phase 倒回 `READY_TO_INTEGRATE`。均已加阶段闸门。
 5. `activePlan.projectId` 原为 `undefined as any`；现已写入真实 projectId，并让 store 与宿主绝对路径绑定（换 cwd 复用同一 store 直接拒绝）。
-6. `computeDependencyWaves` 的注释声称会把 `allowedFiles` 重叠的任务拆成子波次，实现并没有；目前仅靠三路合并的冲突检测兜底（**已知限制，未改动**）。
-7. 全量 `host ↔ layer` 校验为 O(仓库文件数) 读盘；`orch_status` 才会做全量校验，合并时只严格校验被合并路径，其余漂移仅告警。
-8. 遗留限制：若 wave 中存在 `escalated` 任务，合并后会把宿主直接编辑 re-import 成额外一层；该层没有 pre-image 快照，`orch_rollback_integration` 会明确拒绝而不是盲目回滚。
+6. `computeDependencyWaves` 的注释声称会把 `allowedFiles` 重叠的任务拆成子波次，实现并没有；已在 `verifier.ts` 中实现（`allowedFilesOverlap` + 贪心 first-fit 子波次拆分），`index.ts` 改为直接 import 该实现并删除本地副本，重叠任务现在落到顺序子波次而不是并发写冲突。
+7. 全量 `host ↔ layer` 校验为 O(仓库文件数) 读盘；已改为分层校验：合并时只严格校验被合并路径（`verifyHostMatchesTree(..., onlyPaths)`，复用 stat 缓存），其余漂移写入 `hostDrift` 告警，仅 `orch_status` 做全量校验。
+8. `escalated` 任务原先在合并后把宿主直接编辑 re-import 成额外一层，该层没有 pre-image 快照，`orch_rollback_integration` 只能拒绝回滚；已改为 `mergeAndPublishWave(..., { includeHostEdits: true })` 把宿主编辑并入同一个 wave 层（带完整 pre-image 快照），并用 `rollbackPublishedLayer(..., { targetParentLayerId })` 回滚到记录的父层。

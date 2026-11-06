@@ -72,7 +72,22 @@ export interface HostSnapshotEntry {
 	type?: "file" | "symlink" | "directory";
 	objectId?: string;
 	mode?: number;
+	size?: number;
 	symlinkTarget?: string;
+}
+
+/**
+ * Nanosecond-resolution fingerprint of one host path, used to prove that a file's
+ * bytes are unchanged without reading them back from disk.
+ */
+export interface StatCacheEntry {
+	dev: string;
+	ino: string;
+	size: number;
+	mode: number;
+	mtimeNs: string;
+	ctimeNs: string;
+	objectId: string;
 }
 
 /** Pre-image of the host working tree, captured before a published layer is applied. */
@@ -95,6 +110,9 @@ interface StoreMetadata {
 	objectSizes: Record<string, number>;
 	branches: Record<string, BranchRecord>;
 }
+
+/** Contributor name used when direct host working-tree edits are merged into a wave */
+export const HOST_CONTRIBUTOR = "<host>";
 
 /** Heavy dependency/build directories projected via O(1) symlink rather than tree copy */
 const SHARED_DEPENDENCY_DIRS = new Set([
@@ -204,9 +222,14 @@ export class LayerFSEngine {
 	private readonly commitsDir: string;
 	private readonly workspacesDir: string;
 	private readonly snapshotsDir: string;
+	private readonly statCachePath: string;
 	private readonly metaPath: string;
 	private readonly projectId: string;
 	private readonly sourceRoot: string;
+
+	/** In-memory view of `stat-cache.json`: host relPath -> nanosecond fingerprint. */
+	private statCache?: Map<string, StatCacheEntry>;
+	private statCacheDirty = false;
 
 	constructor(sourceRoot: string, projectId?: string) {
 		this.sourceRoot = path.resolve(sourceRoot);
@@ -218,6 +241,7 @@ export class LayerFSEngine {
 		this.commitsDir = path.join(this.storeRoot, "commits");
 		this.workspacesDir = path.join(this.storeRoot, "workspaces");
 		this.snapshotsDir = path.join(this.storeRoot, "host-snapshots");
+		this.statCachePath = path.join(this.storeRoot, "stat-cache.json");
 		this.metaPath = path.join(this.storeRoot, "store-meta.json");
 	}
 
@@ -291,8 +315,133 @@ export class LayerFSEngine {
 		return buf;
 	}
 
+	public hasCanonicalBlob(objectId: string): boolean {
+		if (!objectId) return false;
+		try {
+			return fs.statSync(this.objectPath(objectId)).isFile();
+		} catch {
+			return false;
+		}
+	}
+
+	// ------------------------------------------------------------------
+	// Nanosecond stat cache (issue 7)
+	//
+	// Re-reading every host file just to prove it is unchanged makes full-tree
+	// verification O(bytes). Linux bumps `ctime`/`mtime` (with ns resolution) on any
+	// write, so remembering {dev, ino, size, mode, mtimeNs, ctimeNs} -> objectId lets
+	// us reuse the canonical ObjectId without touching the file contents. Calling
+	// `lstatSync` after a write also sets I_CTIME_QUERIED on the inode, guaranteeing
+	// later modifications advance the timestamps we compare against.
+	// ------------------------------------------------------------------
+
+	private getStatCache(): Map<string, StatCacheEntry> {
+		if (this.statCache) return this.statCache;
+		const cache = new Map<string, StatCacheEntry>();
+		try {
+			if (fs.existsSync(this.statCachePath)) {
+				const parsed = JSON.parse(fs.readFileSync(this.statCachePath, "utf-8")) as Record<
+					string,
+					StatCacheEntry
+				>;
+				for (const [relPath, entry] of Object.entries(parsed ?? {})) {
+					if (
+						entry &&
+						typeof entry.objectId === "string" &&
+						typeof entry.mtimeNs === "string" &&
+						typeof entry.ctimeNs === "string"
+					) {
+						cache.set(relPath, entry);
+					}
+				}
+			}
+		} catch {
+			// A missing/corrupt cache simply means "re-read from disk".
+		}
+		this.statCache = cache;
+		return cache;
+	}
+
+	private persistStatCache(): void {
+		if (!this.statCache || !this.statCacheDirty) return;
+		const serialized: Record<string, StatCacheEntry> = {};
+		for (const [relPath, entry] of this.statCache) serialized[relPath] = entry;
+		this.statCacheDirty = false;
+		try {
+			this.atomicWriteJson(this.statCachePath, serialized);
+		} catch {
+			// The cache is only an optimization: never fail an operation because of it.
+		}
+	}
+
+	private static fingerprint(stat: fs.BigIntStats): {
+		dev: string;
+		ino: string;
+		size: number;
+		mode: number;
+		mtimeNs: string;
+		ctimeNs: string;
+	} {
+		return {
+			dev: stat.dev.toString(),
+			ino: stat.ino.toString(),
+			size: Number(stat.size),
+			mode: Number(stat.mode),
+			mtimeNs: stat.mtimeNs.toString(),
+			ctimeNs: stat.ctimeNs.toString(),
+		};
+	}
+
+	private statCacheHit(relPath: string, stat: fs.BigIntStats): StatCacheEntry | undefined {
+		const cached = this.getStatCache().get(relPath);
+		if (!cached) return undefined;
+		const fp = LayerFSEngine.fingerprint(stat);
+		if (
+			cached.dev !== fp.dev ||
+			cached.ino !== fp.ino ||
+			cached.size !== fp.size ||
+			cached.mode !== fp.mode ||
+			cached.mtimeNs !== fp.mtimeNs ||
+			cached.ctimeNs !== fp.ctimeNs
+		) {
+			return undefined;
+		}
+		return cached;
+	}
+
+	private updateStatCache(relPath: string, stat: fs.BigIntStats, objectId: string): void {
+		const fp = LayerFSEngine.fingerprint(stat);
+		this.getStatCache().set(relPath, { ...fp, objectId });
+		this.statCacheDirty = true;
+	}
+
+	private deleteStatCacheEntry(relPath: string): void {
+		if (this.getStatCache().delete(relPath)) this.statCacheDirty = true;
+	}
+
+	/**
+	 * Re-reads the host fingerprint AFTER a write/restore. The `lstatSync` call is
+	 * intentional: it marks the inode as queried so a later external modification is
+	 * guaranteed to advance mtime/ctime and therefore invalidate this cache entry.
+	 */
+	private refreshStatCacheFromHost(relPath: string, objectId?: string): void {
+		try {
+			const stat = fs.lstatSync(this.safeHostPath(relPath), { bigint: true });
+			if (!objectId || !stat.isFile()) {
+				this.deleteStatCacheEntry(relPath);
+				return;
+			}
+			this.updateStatCache(relPath, stat, objectId);
+		} catch {
+			this.deleteStatCacheEntry(relPath);
+		}
+	}
+
 	private scanTree(rootDir: string, meta: StoreMetadata): TreeManifest {
 		const manifest: TreeManifest = {};
+		// The stat cache is only meaningful for the host working tree; workspace scans
+		// use the same relPaths but a different root, so they must never pollute it.
+		const cacheEnabled = path.resolve(rootDir) === this.sourceRoot;
 
 		const walk = (currentDir: string, relPrefix: string) => {
 			let entries: fs.Dirent[];
@@ -331,9 +480,31 @@ export class LayerFSEngine {
 						size: buf.byteLength,
 						symlinkTarget: linkTarget,
 					};
+					if (cacheEnabled) this.deleteStatCacheEntry(relPath);
 				} else if (lstat.isDirectory()) {
 					walk(fullPath, relPath);
 				} else if (lstat.isFile()) {
+					const statBig = (() => {
+						try {
+							return fs.lstatSync(fullPath, { bigint: true });
+						} catch {
+							return undefined;
+						}
+					})();
+					if (!statBig) continue;
+					if (cacheEnabled) {
+						const cached = this.statCacheHit(relPath, statBig);
+						if (cached && this.hasCanonicalBlob(cached.objectId)) {
+							// Unchanged bytes: reuse the canonical ObjectId without re-reading.
+							manifest[relPath] = {
+								type: "file",
+								objectId: cached.objectId,
+								mode: (Number(statBig.mode) & 0o111) !== 0 ? 0o755 : 0o644,
+								size: Number(statBig.size),
+							};
+							continue;
+						}
+					}
 					const buf = fs.readFileSync(fullPath);
 					const objectId = this.writeCanonicalBlob(buf, meta);
 					const executable = (lstat.mode & 0o111) !== 0;
@@ -343,11 +514,17 @@ export class LayerFSEngine {
 						mode: executable ? 0o755 : 0o644,
 						size: buf.byteLength,
 					};
+					if (cacheEnabled) {
+						// Fingerprint AFTER reading: queried atime/ctime must not point at a
+						// pre-read inode state, otherwise a concurrent write would be masked.
+						this.refreshStatCacheFromHost(relPath, objectId);
+					}
 				}
 			}
 		};
 
 		walk(rootDir, "");
+		if (cacheEnabled) this.persistStatCache();
 		return manifest;
 	}
 
@@ -396,8 +573,9 @@ export class LayerFSEngine {
 		const tree = this.scanTree(this.sourceRoot, meta);
 		const parentLayerId = meta.headLayerId || undefined;
 		let treeRegressionWarning: string | undefined;
+		let parentTree: TreeManifest | undefined;
 		if (parentLayerId) {
-			const parentTree = this.loadLayer(parentLayerId).tree;
+			parentTree = this.loadLayer(parentLayerId).tree;
 			const dropped = Object.keys(parentTree).filter((p) => !(p in tree));
 			if (dropped.length > 0) {
 				treeRegressionWarning =
@@ -408,6 +586,15 @@ export class LayerFSEngine {
 		}
 		meta.layerSequence += 1;
 		const layerId = `L${meta.layerSequence}`;
+
+		// A host import is itself a host mutation (the layer records what the host
+		// became). Persist the pre-image of every path that differs from the parent
+		// layer so `rollbackPublishedLayer` can restore the host to the parent tree.
+		if (parentLayerId && parentTree) {
+			this.saveHostSnapshot(
+				this.captureTreeDiffSnapshot(layerId, parentLayerId, parentTree, tree),
+			);
+		}
 
 		const layer: LayerRecord = {
 			layerId,
@@ -711,6 +898,8 @@ export class LayerFSEngine {
 			expectedBaseLayerId?: string;
 			/** Verify host <-> layer consistency after applying the delta (default: true). */
 			verifyHost?: boolean;
+			/** Merge direct host working-tree edits as an extra `<host>` contributor. */
+			includeHostEdits?: boolean;
 		},
 	): WaveMergeResult {
 		const meta = this.loadMeta();
@@ -730,18 +919,19 @@ export class LayerFSEngine {
 			],
 			storeMetrics: this.getMetrics(),
 		});
+		const noop = (): WaveMergeResult => ({
+			ok: true,
+			publishedLayerId: meta.headLayerId,
+			baseLayerId: meta.headLayerId,
+			hostMatchesLayer: true,
+			hostMismatches: [],
+			mergedFiles: [],
+			conflicts: [],
+			storeMetrics: this.getMetrics(),
+		});
 
-		if (branchNames.length === 0) {
-			return {
-				ok: true,
-				publishedLayerId: meta.headLayerId,
-				baseLayerId: meta.headLayerId,
-				hostMatchesLayer: true,
-				hostMismatches: [],
-				mergedFiles: [],
-				conflicts: [],
-				storeMetrics: this.getMetrics(),
-			};
+		if (branchNames.length === 0 && !options.includeHostEdits) {
+			return noop();
 		}
 
 		const baseLayerId = meta.headLayerId;
@@ -750,6 +940,10 @@ export class LayerFSEngine {
 				`Refusing to merge: plan expected base layer ${options.expectedBaseLayerId}, but the store head is ${baseLayerId}. ` +
 					`This wave was most likely already integrated. Use orch_retry_integration (tests only), orch_rollback_integration, or /orch reset.`,
 			);
+		}
+		if (!baseLayerId) {
+			// No base layer yet: nothing to merge against (a host scan would create L1).
+			return noop();
 		}
 		const baseLayer = this.loadLayer(baseLayerId);
 		const mergedTree: TreeManifest = { ...baseLayer.tree };
@@ -764,6 +958,15 @@ export class LayerFSEngine {
 				entry: TreeEntry | undefined;
 			}>
 		>();
+
+		interface WaveContributor {
+			name: string;
+			/** Snapshot the contributor started from (fork base / wave base) */
+			forkBaseTree: TreeManifest;
+			/** Full snapshot the contributor wants to publish */
+			headTree: TreeManifest;
+		}
+		const contributors: WaveContributor[] = [];
 
 		for (const branchName of branchNames) {
 			const branch = meta.branches[branchName];
@@ -788,21 +991,43 @@ export class LayerFSEngine {
 			// current store head (which advances after a previous integrate) makes every
 			// cross-branch new file look like a deletion and silently drops it from the tree.
 			const forkBaseTree = this.loadLayer(branch.baseLayerId).tree;
+			contributors.push({
+				name: branchName,
+				forkBaseTree,
+				headTree: headCommit.tree,
+			});
+		}
+
+		// Direct host edits are just another contributor: they are diffed against the
+		// wave base layer and then flow through the exact same 3-way tree/line merge, so
+		// disjoint edits converge, identical edits dedupe, and conflicts are reported.
+		if (options.includeHostEdits) {
+			const hostTree = this.scanTree(this.sourceRoot, meta);
+			contributors.push({ name: HOST_CONTRIBUTOR, forkBaseTree: baseLayer.tree, headTree: hostTree });
+		}
+
+		for (const contributor of contributors) {
 			const candidatePaths = new Set<string>([
-				...Object.keys(forkBaseTree),
-				...Object.keys(headCommit.tree),
+				...Object.keys(contributor.forkBaseTree),
+				...Object.keys(contributor.headTree),
 			]);
 
 			for (const relPath of candidatePaths) {
-				const forkEntry = forkBaseTree[relPath];
-				const branchEntry = headCommit.tree[relPath];
-				if (forkEntry?.objectId === branchEntry?.objectId) continue;
+				const forkEntry = contributor.forkBaseTree[relPath];
+				const nextEntry = contributor.headTree[relPath];
+				if (forkEntry?.objectId === nextEntry?.objectId) continue;
+				if (!forkEntry && !nextEntry) continue;
 
 				const list = pathTouchMap.get(relPath) ?? [];
-				list.push({ branchName, entry: branchEntry });
+				list.push({ branchName: contributor.name, entry: nextEntry });
 				pathTouchMap.set(relPath, list);
-				if (forkEntry && !branchEntry) explicitDeletions.add(relPath);
+				if (forkEntry && !nextEntry) explicitDeletions.add(relPath);
 			}
+		}
+
+		if (pathTouchMap.size === 0) {
+			// Nothing changed on any branch and (when enabled) nothing changed on the host.
+			return noop();
 		}
 
 		const mergedFiles: WaveMergeResult["mergedFiles"] = [];
@@ -951,26 +1176,60 @@ export class LayerFSEngine {
 		// Publish new Layer and atomically apply delta to host sourceRoot
 		meta.layerSequence += 1;
 		const newLayerId = `L${meta.layerSequence}`;
+		const contributorNames = contributors.map((c) => c.name);
+
+		// A merged tree that shrinks the file count is legal (explicit deletions) but
+		// always worth flagging: host edits merged in by `includeHostEdits` can delete
+		// files just as easily as a stale branch replay can drop them.
+		const baseFileCount = Object.keys(baseLayer.tree).length;
+		const mergedFileCount = Object.keys(mergedTree).length;
+		let treeRegressionWarning: string | undefined;
+		if (mergedFileCount < baseFileCount) {
+			const dropped = Object.keys(baseLayer.tree).filter((p) => !(p in mergedTree));
+			treeRegressionWarning =
+				`Wave merge drops ${dropped.length} file(s) relative to parent layer ${baseLayerId}: ` +
+				`${dropped.slice(0, 20).join(", ")}${dropped.length > 20 ? ", ..." : ""}. ` +
+				`These paths were removed by an explicit branch/host deletion; verify that this is intended.`;
+		}
+
 		const newLayer: LayerRecord = {
 			layerId: newLayerId,
 			parentLayerId: baseLayerId,
 			createdAt: Date.now(),
 			message: options.message,
 			tree: mergedTree,
+			treeRegressionWarning,
 		};
 
-		// Capture the host pre-image BEFORE touching anything. It is persisted first so
-		// a crash/failure can never leave the host in a half-applied, unrecoverable state.
-		const snapshot = this.captureHostSnapshot(newLayerId, baseLayerId, branchNames, mergedFiles, meta);
-		this.saveHostSnapshot(snapshot);
+		// Capture the ACTUAL host pre-image BEFORE touching anything. This is what a
+		// mid-apply failure restores, so it must include direct host edits (they would be
+		// lost if we restored the base tree instead).
+		const preApplySnapshot = this.captureHostSnapshot(
+			newLayerId,
+			baseLayerId,
+			contributorNames,
+			mergedFiles,
+			meta,
+		);
+
+		// Persisted rollback snapshot: rolling back the published layer must restore the
+		// host completely to the BASE layer, so a tree diff (not the current host state)
+		// is persisted whenever direct host edits were folded into the wave.
+		let persistedSnapshot: HostSnapshotRecord = preApplySnapshot;
+		if (options.includeHostEdits) {
+			persistedSnapshot = this.captureTreeDiffSnapshot(newLayerId, baseLayerId, baseLayer.tree, mergedTree);
+			persistedSnapshot.branchNames = contributorNames;
+		}
+		this.saveHostSnapshot(persistedSnapshot);
 
 		let hostVerification = { matches: true, mismatches: [] as string[], checked: 0 };
 		let hostDrift: string[] = [];
 		try {
 			this.applyDeltaToHost(mergedFiles, mergedTree);
 			if (options.verifyHost !== false) {
-				// Strictly verify the paths this wave actually applied. Unrelated host
-				// edits (e.g. direct escalated lead edits re-imported afterwards) are
+				// Strictly verify the paths this wave actually applied (always read from
+				// disk, no stat-cache shortcut, so a half-written file is caught). Unrelated
+				// host edits (e.g. direct escalated lead edits re-imported afterwards) are
 				// reported as drift, but must not abort an otherwise valid merge.
 				hostVerification = this.verifyHostMatchesTree(
 					mergedTree,
@@ -981,10 +1240,11 @@ export class LayerFSEngine {
 						`host <-> layer mismatch on merged paths: ${hostVerification.mismatches.slice(0, 10).join("; ")}`,
 					);
 				}
+				// Full-tree drift check: served from the stat cache for unchanged files.
 				hostDrift = this.verifyHostMatchesTree(mergedTree).mismatches;
 			}
 		} catch (err) {
-			this.restoreHostSnapshot(snapshot);
+			this.restoreHostSnapshot(preApplySnapshot);
 			return refusal(
 				`Failed to apply/verify merged tree on host: ${err instanceof Error ? err.message : String(err)}. ` +
 					`The host working tree was restored from the snapshot and NO layer was published.`,
@@ -1012,6 +1272,7 @@ export class LayerFSEngine {
 			rollbackSnapshotId: newLayerId,
 			mergedFiles,
 			conflicts: [],
+			treeRegressionWarning,
 			storeMetrics: this.getMetrics(),
 		};
 	}
@@ -1077,6 +1338,41 @@ export class LayerFSEngine {
 		return { layerId, parentLayerId, branchNames, createdAt: Date.now(), files };
 	}
 
+	/**
+	 * Captures the pre-image of every path that differs between two trees, using the
+	 * parent tree as the source of truth. Restoring such a record reverts the host to
+	 * `parentTree` for exactly those paths (used by host imports and host-edit merges).
+	 */
+	private captureTreeDiffSnapshot(
+		layerId: string,
+		parentLayerId: string,
+		parentTree: TreeManifest,
+		nextTree: TreeManifest,
+	): HostSnapshotRecord {
+		const files: Record<string, HostSnapshotEntry> = {};
+		const allPaths = new Set<string>([...Object.keys(parentTree), ...Object.keys(nextTree)]);
+		for (const relPath of allPaths) {
+			const prev = parentTree[relPath];
+			const next = nextTree[relPath];
+			if (!prev && !next) continue;
+			// ObjectId is the authenticated content id, so equal ids mean identical bytes.
+			if (prev && next && prev.objectId === next.objectId && prev.type === next.type) continue;
+			if (prev) {
+				files[relPath] = {
+					existed: true,
+					type: prev.type,
+					objectId: prev.objectId,
+					mode: prev.mode,
+					size: prev.size,
+					symlinkTarget: prev.symlinkTarget,
+				};
+			} else {
+				files[relPath] = { existed: false };
+			}
+		}
+		return { layerId, parentLayerId, branchNames: [], createdAt: Date.now(), files };
+	}
+
 	private snapshotPath(layerId: string): string {
 		return path.join(this.snapshotsDir, `${layerId}.json`);
 	}
@@ -1098,17 +1394,25 @@ export class LayerFSEngine {
 			if (stat) {
 				fs.rmSync(full, { force: true, recursive: stat.isDirectory() });
 			}
-			if (!entry.existed) continue;
+			if (!entry.existed) {
+				this.deleteStatCacheEntry(relPath);
+				continue;
+			}
 			fs.mkdirSync(path.dirname(full), { recursive: true });
 			if (entry.type === "symlink" && entry.symlinkTarget !== undefined) {
 				fs.symlinkSync(entry.symlinkTarget, full);
+				// Symlink bytes are content-addressed too, but the snapshot has no objectId here.
+				this.deleteStatCacheEntry(relPath);
 			} else if (entry.type === "directory") {
 				fs.mkdirSync(full, { recursive: true });
+				this.deleteStatCacheEntry(relPath);
 			} else if (entry.type === "file" && entry.objectId) {
 				fs.writeFileSync(full, this.readCanonicalBlob(entry.objectId));
 				if (entry.mode !== undefined) fs.chmodSync(full, entry.mode & 0o7777);
+				this.refreshStatCacheFromHost(relPath, entry.objectId);
 			}
 		}
+		this.persistStatCache();
 	}
 
 	private applyDeltaToHost(
@@ -1123,6 +1427,7 @@ export class LayerFSEngine {
 					throw new Error(`Refusing to delete host directory "${item.path}"`);
 				}
 				if (existing) fs.rmSync(hostFilePath, { force: true });
+				this.deleteStatCacheEntry(item.path);
 				continue;
 			}
 			const entry = mergedTree[item.path];
@@ -1136,12 +1441,17 @@ export class LayerFSEngine {
 			if (existing) fs.rmSync(hostFilePath, { force: true });
 			if (entry.type === "symlink" && entry.symlinkTarget !== undefined) {
 				fs.symlinkSync(entry.symlinkTarget, hostFilePath);
+				this.deleteStatCacheEntry(item.path);
 			} else {
 				const buf = this.readCanonicalBlob(entry.objectId);
 				fs.writeFileSync(hostFilePath, buf, { mode: entry.mode });
 				fs.chmodSync(hostFilePath, entry.mode & 0o7777);
+				// lstat AFTER the write: marks the inode as queried so any later external
+				// modification is guaranteed to advance mtime/ctime and bust the cache.
+				this.refreshStatCacheFromHost(item.path, entry.objectId);
 			}
 		}
+		this.persistStatCache();
 	}
 
 	private verifyHostMatchesTree(
@@ -1154,35 +1464,106 @@ export class LayerFSEngine {
 	} {
 		const mismatches: string[] = [];
 		let checked = 0;
-		const entries: Array<[string, TreeEntry]> = onlyPaths
-			? onlyPaths.filter((p) => p in tree).map((p) => [p, tree[p]])
-			: Object.entries(tree);
-		for (const [relPath, entry] of entries) {
+		// An explicit path list is a strict post-apply verification: those paths are
+		// ALWAYS re-read from disk. A full-tree check (hostDrift / verifyHostMatchesLayer)
+		// may skip unchanged files via the stat cache (issue 7).
+		const strictPaths = Boolean(onlyPaths);
+		const paths = onlyPaths ? Array.from(new Set(onlyPaths)) : Object.keys(tree);
+
+		for (const relPath of paths) {
+			const entry = tree[relPath];
 			checked++;
 			const full = this.safeHostPath(relPath);
-			try {
-				const stat = fs.lstatSync(full);
-				if (entry.type === "symlink") {
-					if (!stat.isSymbolicLink() || fs.readlinkSync(full) !== entry.symlinkTarget) {
-						mismatches.push(`${relPath}: symlink mismatch`);
-					}
-				} else if (!stat.isFile()) {
-					mismatches.push(`${relPath}: not a regular file`);
+
+			if (!entry) {
+				// Deleted by the merged tree: the host path must no longer exist.
+				let present = true;
+				try {
+					fs.lstatSync(full, { bigint: true });
+				} catch (err) {
+					const code = (err as NodeJS.ErrnoException)?.code;
+					present = !(code === "ENOENT" || code === "ENOTDIR");
+				}
+				if (present) {
+					mismatches.push(`${relPath}: expected deleted file to be absent`);
 				} else {
+					this.deleteStatCacheEntry(relPath);
+				}
+				if (mismatches.length >= 50) break;
+				continue;
+			}
+
+			const stat = (() => {
+				try {
+					return fs.lstatSync(full, { bigint: true });
+				} catch {
+					return undefined;
+				}
+			})();
+			if (!stat) {
+				mismatches.push(`${relPath}: missing or unreadable`);
+				this.deleteStatCacheEntry(relPath);
+				if (mismatches.length >= 50) break;
+				continue;
+			}
+
+			if (entry.type === "symlink") {
+				let ok = false;
+				try {
+					ok = stat.isSymbolicLink() && fs.readlinkSync(full) === entry.symlinkTarget;
+				} catch {
+					ok = false;
+				}
+				if (!ok) {
+					mismatches.push(`${relPath}: symlink mismatch`);
+					this.deleteStatCacheEntry(relPath);
+				} else {
+					this.updateStatCache(relPath, stat, entry.objectId);
+				}
+				if (mismatches.length >= 50) break;
+				continue;
+			}
+
+			if (!stat.isFile()) {
+				mismatches.push(`${relPath}: not a regular file`);
+				this.deleteStatCacheEntry(relPath);
+				if (mismatches.length >= 50) break;
+				continue;
+			}
+
+			if (!strictPaths) {
+				const cached = this.statCacheHit(relPath, stat);
+				if (cached && this.hasCanonicalBlob(cached.objectId)) {
+					// Provably unchanged bytes: compare ObjectIds without reading the file.
+					if (cached.objectId !== entry.objectId) {
+						mismatches.push(`${relPath}: content mismatch`);
+					}
+					if (mismatches.length >= 50) break;
+					continue;
+				}
+			}
+
+			const actualId = (() => {
+				try {
 					const buf = fs.readFileSync(full);
 					const header = Buffer.from(`blob ${buf.byteLength}\0`, "utf-8");
-					const actualId = crypto
-						.createHash("sha256")
-						.update(header)
-						.update(buf)
-						.digest("hex");
-					if (actualId !== entry.objectId) mismatches.push(`${relPath}: content mismatch`);
+					return crypto.createHash("sha256").update(header).update(buf).digest("hex");
+				} catch {
+					return undefined;
 				}
-			} catch {
+			})();
+			if (actualId === undefined) {
 				mismatches.push(`${relPath}: missing or unreadable`);
+				this.deleteStatCacheEntry(relPath);
+				if (mismatches.length >= 50) break;
+				continue;
 			}
+			if (actualId !== entry.objectId) mismatches.push(`${relPath}: content mismatch`);
+			// Fingerprint AFTER the read so the cached stat can never predate the bytes.
+			this.refreshStatCacheFromHost(relPath, actualId);
 			if (mismatches.length >= 50) break;
 		}
+		this.persistStatCache();
 		return { matches: mismatches.length === 0, mismatches, checked };
 	}
 
@@ -1222,10 +1603,17 @@ export class LayerFSEngine {
 	}
 
 	/**
-	 * One-click rollback of the LAST published layer: restores the host pre-image
-	 * captured before the delta was applied and resets the store head to the parent.
+	 * One-click rollback of published layer(s): restores the host pre-image snapshots
+	 * and resets the store head to the target parent layer.
+	 *
+	 * - `rollbackPublishedLayer()` / `rollbackPublishedLayer("L3")` rolls back the head layer.
+	 * - `rollbackPublishedLayer("L3", { targetParentLayerId: "L1" })` atomically rolls back
+	 *   the whole L3 -> L2 -> L1 chain (every layer must have a persisted snapshot).
 	 */
-	public rollbackPublishedLayer(layerId?: string): {
+	public rollbackPublishedLayer(
+		layerId?: string,
+		options?: { targetParentLayerId?: string },
+	): {
 		ok: boolean;
 		restoredLayerId?: string;
 		hostMatchesLayer?: boolean;
@@ -1240,28 +1628,95 @@ export class LayerFSEngine {
 				message: `Cannot roll back ${target}: it is not the head layer (${meta.headLayerId}). Only the latest layer can be rolled back.`,
 			};
 		}
-		const snapshot = this.loadHostSnapshot(target);
-		if (!snapshot) {
-			return {
-				ok: false,
-				message: `No host pre-image snapshot found for ${target}; refusing to roll back blindly.`,
-			};
-		}
-		const layer = this.loadLayer(target);
-		if (!layer.parentLayerId) {
+
+		const headLayer = this.loadLayer(target);
+		const targetParentLayerId = options?.targetParentLayerId ?? headLayer.parentLayerId;
+		if (!targetParentLayerId) {
 			return { ok: false, message: `Layer ${target} has no parent layer; refusing to roll back.` };
 		}
-		this.restoreHostSnapshot(snapshot);
-		meta.headLayerId = layer.parentLayerId;
+		if (!headLayer.parentLayerId) {
+			return { ok: false, message: `Layer ${target} has no parent layer; refusing to roll back.` };
+		}
+
+		// Validate the WHOLE chain (parent + persisted pre-image snapshot, target parent
+		// reachable) BEFORE touching the host, so a failure cannot half-rollback the tree.
+		type RollbackStep = { layer: LayerRecord; snapshot: HostSnapshotRecord };
+		const chain: RollbackStep[] = [];
+		const seen = new Set<string>();
+		let current: LayerRecord = headLayer;
+		for (;;) {
+			if (seen.has(current.layerId)) {
+				return {
+					ok: false,
+					message: `Layer parent chain from ${target} is cyclic at ${current.layerId}; refusing to roll back.`,
+				};
+			}
+			seen.add(current.layerId);
+			if (!current.parentLayerId) {
+				return {
+					ok: false,
+					message: `Layer ${current.layerId} has no parent layer; refusing to roll back.`,
+				};
+			}
+			const snapshot = this.loadHostSnapshot(current.layerId);
+			if (!snapshot) {
+				return {
+					ok: false,
+					message: `No host pre-image snapshot found for ${current.layerId}; refusing to roll back blindly.`,
+				};
+			}
+			chain.push({ layer: current, snapshot });
+			if (current.parentLayerId === targetParentLayerId) break;
+			if (current.parentLayerId === current.layerId) {
+				return { ok: false, message: `Layer ${current.layerId} is its own parent; refusing to roll back.` };
+			}
+			try {
+				current = this.loadLayer(current.parentLayerId);
+			} catch {
+				return {
+					ok: false,
+					message: `Layer parent chain from ${target} is broken at ${current.parentLayerId}; refusing to roll back.`,
+				};
+			}
+		}
+		// The restored head must be a real layer that still exists in the store.
+		try {
+			this.loadLayer(targetParentLayerId);
+		} catch {
+			return {
+				ok: false,
+				message: `Target parent layer ${targetParentLayerId} does not exist; refusing to roll back.`,
+			};
+		}
+
+		// Apply restoreHostSnapshot from the head downwards (reverse chronological).
+		try {
+			for (const step of chain) {
+				this.restoreHostSnapshot(step.snapshot);
+			}
+		} catch (err) {
+			return {
+				ok: false,
+				message:
+					`Restoring host snapshots for ${chain.map((s) => s.layer.layerId).join(" -> ")} failed: ` +
+					`${err instanceof Error ? err.message : String(err)}. The store head was left unchanged at ${meta.headLayerId}.`,
+			};
+		}
+
+		meta.headLayerId = targetParentLayerId;
 		this.saveMeta(meta);
-		const verification = this.verifyHostMatchesLayer(meta.headLayerId);
+		const verification = this.verifyHostMatchesLayer(targetParentLayerId);
+		const rolledBack = chain.map((s) => s.layer.layerId);
 		return {
 			ok: true,
-			restoredLayerId: meta.headLayerId,
+			restoredLayerId: targetParentLayerId,
 			hostMatchesLayer: verification.matches,
 			message:
-				`Rolled back layer ${target}: host restored from pre-image snapshot, head is now ${meta.headLayerId}. ` +
-				`The rolled-back layer stays in the store for audit.`,
+				chain.length === 1
+					? `Rolled back layer ${rolledBack[0]}: host restored from pre-image snapshot, head is now ${targetParentLayerId}. ` +
+						`The rolled-back layer stays in the store for audit.`
+					: `Rolled back layers ${rolledBack.join(" -> ")}: host restored from pre-image snapshots, head is now ${targetParentLayerId}. ` +
+						`The rolled-back layers stay in the store for audit.`,
 		};
 	}
 

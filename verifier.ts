@@ -22,6 +22,224 @@ import type {
 	WorkerStructuredReport,
 } from "./types.ts";
 
+// ---------------------------------------------------------------------------
+// Dependency waves & allowedFiles overlap detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalizes a LayerFS relative path or glob: forward slashes, no leading `./`,
+ * no duplicated separators and no trailing slash.
+ */
+function normalizeRelPath(relPath: string): string {
+	let out = relPath.replace(/\\/g, "/");
+	while (out.startsWith("./")) out = out.slice(2);
+	out = out.replace(/\/{2,}/g, "/");
+	out = out.replace(/\/+$/, "");
+	return out;
+}
+
+function hasGlobWildcard(pattern: string): boolean {
+	return pattern.includes("*") || pattern.includes("?");
+}
+
+/**
+ * Character-level glob intersection: is there any single path *segment* matched
+ * by both segment globs? `*` matches any run of non-separator characters and
+ * `?` matches exactly one character.
+ */
+function segmentGlobsIntersect(segA: string, segB: string): boolean {
+	const memo = new Map<number, boolean>();
+	const lenA = segA.length;
+	const lenB = segB.length;
+
+	const visit = (i: number, j: number): boolean => {
+		const key = i * (lenB + 1) + j;
+		const cached = memo.get(key);
+		if (cached !== undefined) return cached;
+
+		let result: boolean;
+		if (i === lenA && j === lenB) {
+			result = true;
+		} else if (i < lenA && segA[i] === "*") {
+			// `*` matches the empty string, or consumes one character produced by segB.
+			result = visit(i + 1, j) || (j < lenB && visit(i, j + 1));
+		} else if (j < lenB && segB[j] === "*") {
+			result = visit(i, j + 1) || (i < lenA && visit(i + 1, j));
+		} else if (i < lenA && j < lenB) {
+			const charA = segA[i];
+			const charB = segB[j];
+			if (charA === "?" || charB === "?") {
+				result = visit(i + 1, j + 1);
+			} else {
+				result = charA === charB && visit(i + 1, j + 1);
+			}
+		} else {
+			result = false;
+		}
+
+		memo.set(key, result);
+		return result;
+	};
+
+	return visit(0, 0);
+}
+
+/**
+ * Segment-level glob intersection: is there any path matched by both globs?
+ * `**` matches zero or more whole segments; every other segment is compared with
+ * the character-level intersection above.
+ */
+function pathGlobsIntersect(patternA: string, patternB: string): boolean {
+	const segsA = patternA.split("/");
+	const segsB = patternB.split("/");
+	const lenA = segsA.length;
+	const lenB = segsB.length;
+	const memo = new Map<number, boolean>();
+
+	const visit = (i: number, j: number): boolean => {
+		const key = i * (lenB + 1) + j;
+		const cached = memo.get(key);
+		if (cached !== undefined) return cached;
+
+		let result: boolean;
+		if (i === lenA && j === lenB) {
+			result = true;
+		} else if (i < lenA && segsA[i] === "**") {
+			result = visit(i + 1, j) || (j < lenB && visit(i, j + 1));
+		} else if (j < lenB && segsB[j] === "**") {
+			result = visit(i, j + 1) || (i < lenA && visit(i + 1, j));
+		} else if (i < lenA && j < lenB) {
+			result = segmentGlobsIntersect(segsA[i], segsB[j]) && visit(i + 1, j + 1);
+		} else {
+			result = false;
+		}
+
+		memo.set(key, result);
+		return result;
+	};
+
+	return visit(0, 0);
+}
+
+/**
+ * Returns true when two LayerFS path/glob patterns can address at least one common file.
+ *
+ * LayerFS scope semantics: a wildcard-free path matches the file itself *and* every
+ * descendant (`dir` covers `dir/**`), so such patterns are expanded into both forms
+ * before checking for a common path.
+ */
+export function patternsOverlap(patternA: string, patternB: string): boolean {
+	const normA = normalizeRelPath(patternA);
+	const normB = normalizeRelPath(patternB);
+	if (!normA || !normB) return false;
+	if (normA === normB) return true;
+
+	// Cheap, engine-faithful shortcut: a pattern that directly matches the other.
+	if (matchesAnyPattern(normA, [normB]) || matchesAnyPattern(normB, [normA])) return true;
+
+	const expand = (pattern: string): string[] =>
+		hasGlobWildcard(pattern) ? [pattern] : [pattern, `${pattern}/**`];
+
+	for (const candidateA of expand(normA)) {
+		for (const candidateB of expand(normB)) {
+			if (pathGlobsIntersect(candidateA, candidateB)) return true;
+		}
+	}
+
+	return false;
+}
+
+/** Returns true when any pair of `allowedFiles` patterns can address the same file. */
+export function allowedFilesOverlap(patternsA: string[], patternsB: string[]): boolean {
+	for (const patternA of patternsA) {
+		for (const patternB of patternsB) {
+			if (patternsOverlap(patternA, patternB)) return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Computes topological dependency waves from task specs.
+ * Also splits tasks in the same wave into sequential sub-waves when their allowedFiles
+ * overlap, preventing avoidable write collisions.
+ *
+ * Ready tasks are greedily packed (in declaration order) into the earliest sub-wave
+ * that contains no overlapping `allowedFiles`; overlapping tasks spill into a new
+ * sequential sub-wave instead of running concurrently.
+ */
+export function computeDependencyWaves(tasks: TaskSpec[]): { waves: string[][]; error?: string } {
+	const taskMap = new Map<string, TaskSpec>();
+	for (const t of tasks) {
+		if (taskMap.has(t.id)) {
+			return { waves: [], error: `Duplicate task ID: "${t.id}"` };
+		}
+		taskMap.set(t.id, t);
+	}
+
+	for (const t of tasks) {
+		for (const dep of t.dependsOn) {
+			if (!taskMap.has(dep)) {
+				return {
+					waves: [],
+					error: `Task "${t.id}" depends on unknown task "${dep}".`,
+				};
+			}
+			if (dep === t.id) {
+				return {
+					waves: [],
+					error: `Task "${t.id}" cannot depend on itself.`,
+				};
+			}
+		}
+	}
+
+	const completed = new Set<string>();
+	const pending = new Set<string>(tasks.map((t) => t.id));
+	const waves: string[][] = [];
+
+	while (pending.size > 0) {
+		const ready: string[] = [];
+		for (const t of tasks) {
+			if (!pending.has(t.id)) continue;
+			if (t.dependsOn.every((dep) => completed.has(dep))) ready.push(t.id);
+		}
+
+		if (ready.length === 0) {
+			return {
+				waves: [],
+				error: `Cyclic dependency detected among tasks: ${Array.from(pending).join(", ")}`,
+			};
+		}
+
+		// Greedy first-fit packing of non-overlapping ready tasks into sequential sub-waves.
+		const subWaves: string[][] = [];
+		for (const id of ready) {
+			const candidate = taskMap.get(id)!;
+			let placed = false;
+			for (const subWave of subWaves) {
+				const collides = subWave.some((existingId) =>
+					allowedFilesOverlap(taskMap.get(existingId)!.allowedFiles, candidate.allowedFiles),
+				);
+				if (!collides) {
+					subWave.push(id);
+					placed = true;
+					break;
+				}
+			}
+			if (!placed) subWaves.push([id]);
+		}
+
+		for (const subWave of subWaves) waves.push(subWave);
+		for (const id of ready) {
+			pending.delete(id);
+			completed.add(id);
+		}
+	}
+
+	return { waves };
+}
+
 const TEST_SKIP_OR_ONLY_PATTERNS: Array<{ label: string; regex: RegExp }> = [
 	{ label: ".only() focus filter", regex: /\b(it|test|describe|context)\.only\s*\(/ },
 	{ label: "fit/fdescribe focus filter", regex: /\b(fit|fdescribe)\s*\(/ },

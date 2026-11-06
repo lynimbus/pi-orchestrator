@@ -57,6 +57,7 @@ import type {
 } from "./types.ts";
 import {
 	type CommandResult,
+	computeDependencyWaves,
 	executeWorkspaceCommand,
 	formatCommandDiagnostics,
 } from "./verifier.ts";
@@ -149,67 +150,6 @@ function setupSubagentWorkerMode(pi: ExtensionAPI): void {
 			}
 		}
 	});
-}
-
-/**
- * Computes topological dependency waves from task specs.
- * Also splits tasks in the same wave into subsequent sub-waves if their allowedFiles overlap
- * identically, preventing avoidable write collisions.
- */
-function computeDependencyWaves(tasks: TaskSpec[]): { waves: string[][]; error?: string } {
-	const taskMap = new Map<string, TaskSpec>();
-	for (const t of tasks) {
-		if (taskMap.has(t.id)) {
-			return { waves: [], error: `Duplicate task ID: "${t.id}"` };
-		}
-		taskMap.set(t.id, t);
-	}
-
-	for (const t of tasks) {
-		for (const dep of t.dependsOn) {
-			if (!taskMap.has(dep)) {
-				return {
-					waves: [],
-					error: `Task "${t.id}" depends on unknown task "${dep}".`,
-				};
-			}
-			if (dep === t.id) {
-				return {
-					waves: [],
-					error: `Task "${t.id}" cannot depend on itself.`,
-				};
-			}
-		}
-	}
-
-	const completed = new Set<string>();
-	const remaining = new Set<string>(tasks.map((t) => t.id));
-	const waves: string[][] = [];
-
-	while (remaining.size > 0) {
-		const ready: string[] = [];
-		for (const id of remaining) {
-			const spec = taskMap.get(id)!;
-			if (spec.dependsOn.every((dep) => completed.has(dep))) {
-				ready.push(id);
-			}
-		}
-
-		if (ready.length === 0) {
-			return {
-				waves: [],
-				error: `Cyclic dependency detected among tasks: ${Array.from(remaining).join(", ")}`,
-			};
-		}
-
-		waves.push(ready);
-		for (const id of ready) {
-			remaining.delete(id);
-			completed.add(id);
-		}
-	}
-
-	return { waves };
 }
 
 export default function orchestratorExtension(pi: ExtensionAPI): void {
@@ -1253,6 +1193,9 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			const approvedBranches = currentWaveIds
 				.filter((id) => plan.tasks[id].state.status === "approved")
 				.map((id) => plan.tasks[id].state.branchName);
+			const escalatedIds = currentWaveIds.filter(
+				(id) => plan.tasks[id].state.status === "escalated",
+			);
 
 			let mergeResult;
 			try {
@@ -1260,6 +1203,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 					allowAutoThreeWayLineMerge: config.allowAutoThreeWayLineMerge,
 					message: `Wave ${waveIdx + 1}: ${params.commitMessage}`,
 					expectedBaseLayerId: parentLayerId,
+					includeHostEdits: escalatedIds.length > 0,
 				});
 			} catch (err) {
 				plan.phase = "READY_TO_INTEGRATE";
@@ -1319,24 +1263,12 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				};
 			}
 
-			let publishedLayerId = mergeResult.publishedLayerId!;
-			const escalatedIds = currentWaveIds.filter(
-				(id) => plan.tasks[id].state.status === "escalated",
-			);
+			const publishedLayerId = mergeResult.publishedLayerId!;
+			// Escalated tasks are merged as direct host edits into the SAME wave layer
+			// (with a full pre-image snapshot), so no extra, un-snapshotted layer is published.
 			let reimportWarning = "";
-			if (escalatedIds.length > 0) {
-				try {
-					const reimported = engine.importHostAsLayer(
-						`Wave ${waveIdx + 1} escalated direct lead edits: ${params.commitMessage}`,
-						{ expectedParentLayerId: publishedLayerId },
-					);
-					publishedLayerId = reimported.layerId;
-					if (reimported.treeRegressionWarning) {
-						reimportWarning = `\n⚠ ${reimported.treeRegressionWarning}`;
-					}
-				} catch (err) {
-					reimportWarning = `\n⚠ Could not re-import escalated host edits: ${err instanceof Error ? err.message : String(err)}`;
-				}
+			if (mergeResult.treeRegressionWarning) {
+				reimportWarning = `\n⚠ ${mergeResult.treeRegressionWarning}`;
 			}
 
 			// Commit the wave state BEFORE running tests. Even if the test command fails
@@ -1534,7 +1466,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			}
 			const rec = plan.integration!;
 
-			const rollback = engine.rollbackPublishedLayer(rec.publishedLayerId);
+			const rollback = engine.rollbackPublishedLayer(rec.publishedLayerId, { targetParentLayerId: rec.parentLayerId });
 			if (!rollback.ok || !rollback.restoredLayerId) {
 				return {
 					content: [{ type: "text", text: `✗ Rollback refused: ${rollback.message}` }],
