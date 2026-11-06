@@ -1,0 +1,24 @@
+{
+  "name": "pi-orchestrator",
+  "version": "0.1.0",
+  "description": "Strict Lead-Subagent TDD & LayerFS-isolated multi-wave orchestrator extension for Pi",
+  "type": "module",
+  "license": "MIT",
+  "main": "./index.ts",
+  "scripts": {
+    "test": "node ./test.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "keywords": [
+    "pi",
+    "extension",
+    "orchestrator",
+    "subagent",
+    "tdd",
+    "layerfs"
+  ]
+}
