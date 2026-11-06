@@ -45,3 +45,43 @@ pi --orch --orch-model group/deepseek --orch-thinking medium
 4. **第二层主代理纯 Diff 审查 (`orch_dispatch` → `orch_review`)**：
    - `orch_dispatch` 只向主代理返回 **实现代码 Unified Diff**、**单元测试 Unified Diff**、**机械门禁清单** 和 **子代理假设/偏离报告**，保护主代理上下文窗口。
    - 机械门禁未通过的任务，主代理调用 `orch_review(approve)` 会被硬性拒绝，只能 `reject` 打回原工作区重做（最多 `maxRetries` 次）或 `escalate`。
+
+---
+
+## 集成（每个 wave 只调用一次 `orch_integrate`）
+
+> 历史事故：集成测试失败后重试 `orch_integrate`，插件发布了「回退层」并静默抹掉整个 wave 的改动。详见 [`docs/orchestrator-issues.md`](docs/orchestrator-issues.md)。
+
+| 工具 | 作用 |
+| --- | --- |
+| `orch_integrate` | 三路合并 + 发布不可变 Layer + 应用到宿主 + 跑集成测试。**同一 wave 只执行一次**；层一旦发布，重复调用一律 no-op（`INTEGRATION_FAILED` / `COMPLETED`）。 |
+| `orch_retry_integration` | 只重跑集成测试命令，**不合并、不发布层、不改宿主**。可传 `command` 覆盖命令。 |
+| `orch_rollback_integration` | 用发布前的宿主快照一键回滚最新层（恢复文件与 mode、重置 head），并把该 wave 重新打开为 `READY_TO_INTEGRATE`。 |
+
+状态机：`READY_TO_INTEGRATE → INTEGRATING → (通过) COMPLETED / 下一波`，失败则 `INTEGRATION_FAILED`（**层已发布、改动已落地，只是测试没过**）。集成测试无论成功失败，plan 状态都会先推进（任务置 `merged`、`baseLayerId` 前移、host/store 一致），因此不存在「状态没动但 head 已前进」的窗口；进程中断也会在下次调用时按 LayerFS head 自动对账。
+
+### 数据安全闸门
+
+- **stale branch 拒绝**：每个分支的 fork base 必须等于当前 `meta.headLayerId`，否则拒绝合并。
+- **fork-base 差异计算**：分支 head tree 是「fork base 的完整快照」，touch 集合必须相对**分支自己的 fork base** 计算（原来相对当前 head 计算，会把别的分支新增的文件误判成删除）。
+- **无理由删除校验**：父层中出现、合并后消失的每个路径，都必须有分支显式删除，否则拒绝发布（防止回退层）。
+- **宿主快照 + 一致性校验**：应用 delta 前保存宿主 pre-image；应用后严格校验所有被合并路径，失败自动回滚且不发布层。未触及路径的漂移只告警、不阻断。
+- **mode 与 symlink 安全**：覆盖已有文件后显式 `chmod`（可执行位不会丢）；拒绝覆盖/删除宿主上的真实目录；拒绝 `..` 路径穿越。
+- **store 绑定**：LayerFS store 与宿主绝对路径绑定；`store-meta.json` 损坏时抛错而非静默重置（否则会丢失 head）；layer/commit/meta 均原子写入。
+- **状态展示**：`orch_status` 报告 `lastPublishedLayer`、head/parent 文件数（减少时高亮 ⚠ TREE REGRESSION）、`host ↔ layer` 校验结果、集成测试 exit code 与诊断。
+
+### 测试执行环境
+
+- `executeWorkspaceCommand` 在 spawn 前**创建** `TMPDIR` / `XDG_CACHE_HOME`（含 `TMP`/`TEMP`），不可写时回退到 `os.tmpdir()`；宿主集成测试的 scratch 放在 LayerFS store 内，不污染仓库。
+- 失败输出保留 **输出头部 + 全量失败签名行 + 尾部**（原来只有尾部 40 行，会丢根因），并打印环境摘要。
+- 子代理单测结束后清理工作区根目录新产生的垃圾文件（如误写出的 `-` 文件）；子代理进程有 15 分钟硬超时、SIGTERM→SIGKILL 升级与缓冲区上限。
+
+---
+
+## 测试
+
+```bash
+npm test    # node ./test.ts && node ./test-regressions.ts
+```
+
+`test-regressions.ts` 覆盖：重复 integrate 被拒且宿主不变、跨分支新增文件不丢、宿主快照/校验/回滚/重合并、可执行位、非相关漂移、TMPDIR/诊断/超时、损坏 meta、source root 绑定、集成状态机。

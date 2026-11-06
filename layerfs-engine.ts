@@ -44,6 +44,8 @@ export interface LayerRecord {
 	createdAt: number;
 	message: string;
 	tree: TreeManifest;
+	/** Set when the imported tree loses files relative to its parent layer */
+	treeRegressionWarning?: string;
 }
 
 export interface CommitRecord {
@@ -63,6 +65,23 @@ export interface BranchRecord {
 	workspacePath?: string;
 	createdAt: number;
 	updatedAt: number;
+}
+
+export interface HostSnapshotEntry {
+	existed: boolean;
+	type?: "file" | "symlink" | "directory";
+	objectId?: string;
+	mode?: number;
+	symlinkTarget?: string;
+}
+
+/** Pre-image of the host working tree, captured before a published layer is applied. */
+export interface HostSnapshotRecord {
+	layerId: string;
+	parentLayerId: string;
+	branchNames: string[];
+	createdAt: number;
+	files: Record<string, HostSnapshotEntry>;
 }
 
 interface StoreMetadata {
@@ -184,6 +203,7 @@ export class LayerFSEngine {
 	private readonly layersDir: string;
 	private readonly commitsDir: string;
 	private readonly workspacesDir: string;
+	private readonly snapshotsDir: string;
 	private readonly metaPath: string;
 	private readonly projectId: string;
 	private readonly sourceRoot: string;
@@ -197,11 +217,12 @@ export class LayerFSEngine {
 		this.layersDir = path.join(this.storeRoot, "layers");
 		this.commitsDir = path.join(this.storeRoot, "commits");
 		this.workspacesDir = path.join(this.storeRoot, "workspaces");
+		this.snapshotsDir = path.join(this.storeRoot, "host-snapshots");
 		this.metaPath = path.join(this.storeRoot, "store-meta.json");
 	}
 
 	private ensureDirs(): void {
-		for (const dir of [this.storeRoot, this.objectsDir, this.layersDir, this.commitsDir, this.workspacesDir]) {
+		for (const dir of [this.storeRoot, this.objectsDir, this.layersDir, this.commitsDir, this.workspacesDir, this.snapshotsDir]) {
 			fs.mkdirSync(dir, { recursive: true });
 		}
 	}
@@ -209,11 +230,14 @@ export class LayerFSEngine {
 	private loadMeta(): StoreMetadata {
 		this.ensureDirs();
 		if (fs.existsSync(this.metaPath)) {
-			try {
-				return JSON.parse(fs.readFileSync(this.metaPath, "utf-8")) as StoreMetadata;
-			} catch {
-				// Fall through to fresh metadata
+			// NEVER silently reset a corrupt/partially written metadata file: doing so
+			// would make the store forget its head layer and start a fresh L1 from the
+			// (possibly rolled-back) host tree.
+			const parsed = JSON.parse(fs.readFileSync(this.metaPath, "utf-8")) as StoreMetadata;
+			if (!parsed || typeof parsed !== "object" || !("headLayerId" in parsed)) {
+				throw new Error(`LayerFS store metadata is corrupt: ${this.metaPath}`);
 			}
+			return parsed;
 		}
 		return {
 			projectId: this.projectId,
@@ -327,9 +351,15 @@ export class LayerFSEngine {
 		return manifest;
 	}
 
+	private atomicWriteJson(filePath: string, value: unknown): void {
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		const tmp = `${filePath}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
+		fs.writeFileSync(tmp, JSON.stringify(value, null, 2), "utf-8");
+		fs.renameSync(tmp, filePath);
+	}
+
 	private saveLayer(layer: LayerRecord): void {
-		const p = path.join(this.layersDir, `${layer.layerId}.json`);
-		fs.writeFileSync(p, JSON.stringify(layer, null, 2), "utf-8");
+		this.atomicWriteJson(path.join(this.layersDir, `${layer.layerId}.json`), layer);
 	}
 
 	public loadLayer(layerId: string): LayerRecord {
@@ -338,8 +368,7 @@ export class LayerFSEngine {
 	}
 
 	private saveCommit(commit: CommitRecord): void {
-		const p = path.join(this.commitsDir, `${commit.commitId}.json`);
-		fs.writeFileSync(p, JSON.stringify(commit, null, 2), "utf-8");
+		this.atomicWriteJson(path.join(this.commitsDir, `${commit.commitId}.json`), commit);
 	}
 
 	public loadCommit(commitId: string): CommitRecord {
@@ -350,18 +379,43 @@ export class LayerFSEngine {
 	/**
 	 * Imports the current host directory state as a new immutable Layer in the LayerStack.
 	 */
-	public importHostAsLayer(message: string): LayerRecord {
+	public importHostAsLayer(
+		message: string,
+		options: { expectedParentLayerId?: string } = {},
+	): LayerRecord {
 		const meta = this.loadMeta();
+		this.assertStoreMatchesSource(meta);
+		if (
+			options.expectedParentLayerId &&
+			meta.headLayerId !== options.expectedParentLayerId
+		) {
+			throw new Error(
+				`Stale host import: expected parent layer ${options.expectedParentLayerId}, but the store head is ${meta.headLayerId || "(none)"}.`,
+			);
+		}
 		const tree = this.scanTree(this.sourceRoot, meta);
+		const parentLayerId = meta.headLayerId || undefined;
+		let treeRegressionWarning: string | undefined;
+		if (parentLayerId) {
+			const parentTree = this.loadLayer(parentLayerId).tree;
+			const dropped = Object.keys(parentTree).filter((p) => !(p in tree));
+			if (dropped.length > 0) {
+				treeRegressionWarning =
+					`Host import drops ${dropped.length} file(s) present in parent layer ${parentLayerId}: ` +
+					`${dropped.slice(0, 20).join(", ")}${dropped.length > 20 ? ", ..." : ""}. ` +
+					`Verify that these deletions are intentional (untracked files are imported from disk, not from git).`;
+			}
+		}
 		meta.layerSequence += 1;
 		const layerId = `L${meta.layerSequence}`;
 
 		const layer: LayerRecord = {
 			layerId,
-			parentLayerId: meta.headLayerId || undefined,
+			parentLayerId,
 			createdAt: Date.now(),
 			message,
 			tree,
+			treeRegressionWarning,
 		};
 		this.saveLayer(layer);
 		meta.headLayerId = layerId;
@@ -650,13 +704,40 @@ export class LayerFSEngine {
 	 */
 	public mergeAndPublishWave(
 		branchNames: string[],
-		options: { allowAutoThreeWayLineMerge: boolean; message: string },
+		options: {
+			allowAutoThreeWayLineMerge: boolean;
+			message: string;
+			/** Plan's base layer: refuse when the store head has already advanced (duplicate integrate). */
+			expectedBaseLayerId?: string;
+			/** Verify host <-> layer consistency after applying the delta (default: true). */
+			verifyHost?: boolean;
+		},
 	): WaveMergeResult {
 		const meta = this.loadMeta();
+		this.assertStoreMatchesSource(meta);
+		const refusal = (error: string): WaveMergeResult => ({
+			ok: false,
+			error,
+			baseLayerId: meta.headLayerId,
+			mergedFiles: [],
+			conflicts: [
+				{
+					path: "(wave)",
+					branches: branchNames,
+					reason: error,
+					branchObjectIds: {},
+				},
+			],
+			storeMetrics: this.getMetrics(),
+		});
+
 		if (branchNames.length === 0) {
 			return {
 				ok: true,
 				publishedLayerId: meta.headLayerId,
+				baseLayerId: meta.headLayerId,
+				hostMatchesLayer: true,
+				hostMismatches: [],
 				mergedFiles: [],
 				conflicts: [],
 				storeMetrics: this.getMetrics(),
@@ -664,8 +745,16 @@ export class LayerFSEngine {
 		}
 
 		const baseLayerId = meta.headLayerId;
+		if (options.expectedBaseLayerId && options.expectedBaseLayerId !== baseLayerId) {
+			return refusal(
+				`Refusing to merge: plan expected base layer ${options.expectedBaseLayerId}, but the store head is ${baseLayerId}. ` +
+					`This wave was most likely already integrated. Use orch_retry_integration (tests only), orch_rollback_integration, or /orch reset.`,
+			);
+		}
 		const baseLayer = this.loadLayer(baseLayerId);
 		const mergedTree: TreeManifest = { ...baseLayer.tree };
+		/** Paths explicitly deleted by a branch (relative to its OWN fork base) */
+		const explicitDeletions = new Set<string>();
 
 		// Track per-path modifications across branches
 		const pathTouchMap = new Map<
@@ -679,22 +768,40 @@ export class LayerFSEngine {
 		for (const branchName of branchNames) {
 			const branch = meta.branches[branchName];
 			if (!branch) {
-				throw new Error(`Cannot merge unknown branch: ${branchName}`);
+				return refusal(`Cannot merge unknown branch: ${branchName}`);
+			}
+			if (branch.baseLayerId !== baseLayerId) {
+				return refusal(
+					`Stale branch "${branchName}" was forked from ${branch.baseLayerId}, but the wave base is now ${baseLayerId}. ` +
+						`Reject/re-dispatch the task (or roll back the published layer) instead of re-merging stale branch trees.`,
+				);
 			}
 			const headCommit = this.loadCommit(branch.headCommitId);
+			if (headCommit.baseLayerId && headCommit.baseLayerId !== baseLayerId) {
+				return refusal(
+					`Stale commit ${headCommit.commitId} on branch "${branchName}" was based on ${headCommit.baseLayerId}, expected ${baseLayerId}.`,
+				);
+			}
+
+			// CRITICAL: a branch head tree is a FULL snapshot of its fork base, NOT a delta.
+			// Touched paths must be computed against that fork base. Comparing it to the
+			// current store head (which advances after a previous integrate) makes every
+			// cross-branch new file look like a deletion and silently drops it from the tree.
+			const forkBaseTree = this.loadLayer(branch.baseLayerId).tree;
 			const candidatePaths = new Set<string>([
-				...Object.keys(baseLayer.tree),
+				...Object.keys(forkBaseTree),
 				...Object.keys(headCommit.tree),
 			]);
 
 			for (const relPath of candidatePaths) {
-				const baseEntry = baseLayer.tree[relPath];
+				const forkEntry = forkBaseTree[relPath];
 				const branchEntry = headCommit.tree[relPath];
-				if (baseEntry?.objectId === branchEntry?.objectId) continue;
+				if (forkEntry?.objectId === branchEntry?.objectId) continue;
 
 				const list = pathTouchMap.get(relPath) ?? [];
 				list.push({ branchName, entry: branchEntry });
 				pathTouchMap.set(relPath, list);
+				if (forkEntry && !branchEntry) explicitDeletions.add(relPath);
 			}
 		}
 
@@ -820,10 +927,25 @@ export class LayerFSEngine {
 			this.saveMeta(meta);
 			return {
 				ok: false,
+				baseLayerId,
 				mergedFiles: [],
 				conflicts,
 				storeMetrics: this.getMetrics(),
 			};
+		}
+
+		// Guard against silent data loss: every path that disappears from the parent
+		// tree must have been explicitly deleted by a branch. This catches stale-branch
+		// replays and any layer that would shrink the tree without a reason (the L4
+		// rollback layer described in docs/orchestrator-issues.md).
+		const unexplainedDeletions = Object.keys(baseLayer.tree).filter(
+			(relPath) => !(relPath in mergedTree) && !explicitDeletions.has(relPath),
+		);
+		if (unexplainedDeletions.length > 0) {
+			return refusal(
+				`Refusing to publish a layer that drops ${unexplainedDeletions.length} file(s) without an explicit branch deletion: ` +
+					`${unexplainedDeletions.slice(0, 20).join(", ")}${unexplainedDeletions.length > 20 ? ", ..." : ""}`,
+			);
 		}
 
 		// Publish new Layer and atomically apply delta to host sourceRoot
@@ -836,28 +958,43 @@ export class LayerFSEngine {
 			message: options.message,
 			tree: mergedTree,
 		};
+
+		// Capture the host pre-image BEFORE touching anything. It is persisted first so
+		// a crash/failure can never leave the host in a half-applied, unrecoverable state.
+		const snapshot = this.captureHostSnapshot(newLayerId, baseLayerId, branchNames, mergedFiles, meta);
+		this.saveHostSnapshot(snapshot);
+
+		let hostVerification = { matches: true, mismatches: [] as string[], checked: 0 };
+		let hostDrift: string[] = [];
+		try {
+			this.applyDeltaToHost(mergedFiles, mergedTree);
+			if (options.verifyHost !== false) {
+				// Strictly verify the paths this wave actually applied. Unrelated host
+				// edits (e.g. direct escalated lead edits re-imported afterwards) are
+				// reported as drift, but must not abort an otherwise valid merge.
+				hostVerification = this.verifyHostMatchesTree(
+					mergedTree,
+					mergedFiles.map((item) => item.path),
+				);
+				if (!hostVerification.matches) {
+					throw new Error(
+						`host <-> layer mismatch on merged paths: ${hostVerification.mismatches.slice(0, 10).join("; ")}`,
+					);
+				}
+				hostDrift = this.verifyHostMatchesTree(mergedTree).mismatches;
+			}
+		} catch (err) {
+			this.restoreHostSnapshot(snapshot);
+			return refusal(
+				`Failed to apply/verify merged tree on host: ${err instanceof Error ? err.message : String(err)}. ` +
+					`The host working tree was restored from the snapshot and NO layer was published.`,
+			);
+		}
+
+		// Only publish once the host has been verified: a published layer is always
+		// consistent with the host working tree.
 		this.saveLayer(newLayer);
 		meta.headLayerId = newLayerId;
-
-		// Apply delta to host directory
-		for (const item of mergedFiles) {
-			const hostFilePath = path.join(this.sourceRoot, item.path);
-			if (item.changeType === "deleted") {
-				if (fs.existsSync(hostFilePath)) {
-					fs.rmSync(hostFilePath, { force: true });
-				}
-			} else {
-				const entry = mergedTree[item.path];
-				fs.mkdirSync(path.dirname(hostFilePath), { recursive: true });
-				if (entry.type === "symlink" && entry.symlinkTarget !== undefined) {
-					if (fs.existsSync(hostFilePath)) fs.rmSync(hostFilePath, { force: true });
-					fs.symlinkSync(entry.symlinkTarget, hostFilePath);
-				} else {
-					const buf = this.readCanonicalBlob(entry.objectId);
-					fs.writeFileSync(hostFilePath, buf, { mode: entry.mode });
-				}
-			}
-		}
 
 		// Clean up ephemeral workspaces of merged branches
 		for (const branchName of branchNames) {
@@ -868,9 +1005,263 @@ export class LayerFSEngine {
 		return {
 			ok: true,
 			publishedLayerId: newLayerId,
+			baseLayerId,
+			hostMatchesLayer: hostVerification.matches,
+			hostMismatches: hostVerification.mismatches,
+			hostDrift,
+			rollbackSnapshotId: newLayerId,
 			mergedFiles,
 			conflicts: [],
 			storeMetrics: this.getMetrics(),
+		};
+	}
+
+	/** Resolve a tree path safely: never allow absolute paths or `..` traversal out of the host root. */
+	private safeHostPath(relPath: string): string {
+		const normalized = relPath.replace(/\\/g, "/");
+		if (
+			path.isAbsolute(normalized) ||
+			normalized.split("/").includes("..") ||
+			normalized.length === 0
+		) {
+			throw new Error(`Unsafe tree path rejected: "${relPath}"`);
+		}
+		const full = path.resolve(this.sourceRoot, normalized);
+		if (full !== this.sourceRoot && !full.startsWith(this.sourceRoot + path.sep)) {
+			throw new Error(`Tree path escapes host root: "${relPath}"`);
+		}
+		return full;
+	}
+
+	private lstatIfExists(fullPath: string): fs.Stats | undefined {
+		try {
+			return fs.lstatSync(fullPath);
+		} catch {
+			return undefined;
+		}
+	}
+
+	private captureHostSnapshot(
+		layerId: string,
+		parentLayerId: string,
+		branchNames: string[],
+		mergedFiles: WaveMergeResult["mergedFiles"],
+		meta: StoreMetadata,
+	): HostSnapshotRecord {
+		const files: Record<string, HostSnapshotEntry> = {};
+		for (const item of mergedFiles) {
+			const full = this.safeHostPath(item.path);
+			const stat = this.lstatIfExists(full);
+			if (!stat) {
+				files[item.path] = { existed: false };
+				continue;
+			}
+			if (stat.isSymbolicLink()) {
+				files[item.path] = {
+					existed: true,
+					type: "symlink",
+					symlinkTarget: fs.readlinkSync(full),
+					mode: stat.mode & 0o7777,
+				};
+			} else if (stat.isDirectory()) {
+				files[item.path] = { existed: true, type: "directory", mode: stat.mode & 0o7777 };
+			} else {
+				files[item.path] = {
+					existed: true,
+					type: "file",
+					objectId: this.writeCanonicalBlob(fs.readFileSync(full), meta),
+					mode: stat.mode & 0o7777,
+				};
+			}
+		}
+		return { layerId, parentLayerId, branchNames, createdAt: Date.now(), files };
+	}
+
+	private snapshotPath(layerId: string): string {
+		return path.join(this.snapshotsDir, `${layerId}.json`);
+	}
+
+	private saveHostSnapshot(snapshot: HostSnapshotRecord): void {
+		this.atomicWriteJson(this.snapshotPath(snapshot.layerId), snapshot);
+	}
+
+	private loadHostSnapshot(layerId: string): HostSnapshotRecord | undefined {
+		const p = this.snapshotPath(layerId);
+		if (!fs.existsSync(p)) return undefined;
+		return JSON.parse(fs.readFileSync(p, "utf-8")) as HostSnapshotRecord;
+	}
+
+	private restoreHostSnapshot(snapshot: HostSnapshotRecord): void {
+		for (const [relPath, entry] of Object.entries(snapshot.files)) {
+			const full = this.safeHostPath(relPath);
+			const stat = this.lstatIfExists(full);
+			if (stat) {
+				fs.rmSync(full, { force: true, recursive: stat.isDirectory() });
+			}
+			if (!entry.existed) continue;
+			fs.mkdirSync(path.dirname(full), { recursive: true });
+			if (entry.type === "symlink" && entry.symlinkTarget !== undefined) {
+				fs.symlinkSync(entry.symlinkTarget, full);
+			} else if (entry.type === "directory") {
+				fs.mkdirSync(full, { recursive: true });
+			} else if (entry.type === "file" && entry.objectId) {
+				fs.writeFileSync(full, this.readCanonicalBlob(entry.objectId));
+				if (entry.mode !== undefined) fs.chmodSync(full, entry.mode & 0o7777);
+			}
+		}
+	}
+
+	private applyDeltaToHost(
+		mergedFiles: WaveMergeResult["mergedFiles"],
+		mergedTree: TreeManifest,
+	): void {
+		for (const item of mergedFiles) {
+			const hostFilePath = this.safeHostPath(item.path);
+			const existing = this.lstatIfExists(hostFilePath);
+			if (item.changeType === "deleted") {
+				if (existing?.isDirectory()) {
+					throw new Error(`Refusing to delete host directory "${item.path}"`);
+				}
+				if (existing) fs.rmSync(hostFilePath, { force: true });
+				continue;
+			}
+			const entry = mergedTree[item.path];
+			if (!entry) continue;
+			if (existing?.isDirectory()) {
+				throw new Error(`Refusing to overwrite host directory "${item.path}" with a ${entry.type}`);
+			}
+			fs.mkdirSync(path.dirname(hostFilePath), { recursive: true });
+			// Remove first: never write through an existing symlink, and make sure the
+			// recorded mode (e.g. executable bit) is applied to a freshly created file.
+			if (existing) fs.rmSync(hostFilePath, { force: true });
+			if (entry.type === "symlink" && entry.symlinkTarget !== undefined) {
+				fs.symlinkSync(entry.symlinkTarget, hostFilePath);
+			} else {
+				const buf = this.readCanonicalBlob(entry.objectId);
+				fs.writeFileSync(hostFilePath, buf, { mode: entry.mode });
+				fs.chmodSync(hostFilePath, entry.mode & 0o7777);
+			}
+		}
+	}
+
+	private verifyHostMatchesTree(
+		tree: TreeManifest,
+		onlyPaths?: string[],
+	): {
+		matches: boolean;
+		mismatches: string[];
+		checked: number;
+	} {
+		const mismatches: string[] = [];
+		let checked = 0;
+		const entries: Array<[string, TreeEntry]> = onlyPaths
+			? onlyPaths.filter((p) => p in tree).map((p) => [p, tree[p]])
+			: Object.entries(tree);
+		for (const [relPath, entry] of entries) {
+			checked++;
+			const full = this.safeHostPath(relPath);
+			try {
+				const stat = fs.lstatSync(full);
+				if (entry.type === "symlink") {
+					if (!stat.isSymbolicLink() || fs.readlinkSync(full) !== entry.symlinkTarget) {
+						mismatches.push(`${relPath}: symlink mismatch`);
+					}
+				} else if (!stat.isFile()) {
+					mismatches.push(`${relPath}: not a regular file`);
+				} else {
+					const buf = fs.readFileSync(full);
+					const header = Buffer.from(`blob ${buf.byteLength}\0`, "utf-8");
+					const actualId = crypto
+						.createHash("sha256")
+						.update(header)
+						.update(buf)
+						.digest("hex");
+					if (actualId !== entry.objectId) mismatches.push(`${relPath}: content mismatch`);
+				}
+			} catch {
+				mismatches.push(`${relPath}: missing or unreadable`);
+			}
+			if (mismatches.length >= 50) break;
+		}
+		return { matches: mismatches.length === 0, mismatches, checked };
+	}
+
+	/** Verify that the host working tree still matches a published LayerFS layer. */
+	public verifyHostMatchesLayer(layerId?: string): {
+		matches: boolean;
+		mismatches: string[];
+		checked: number;
+		layerId: string;
+	} {
+		const meta = this.loadMeta();
+		const id = layerId ?? meta.headLayerId;
+		if (!id) return { matches: true, mismatches: [], checked: 0, layerId: "" };
+		const result = this.verifyHostMatchesTree(this.loadLayer(id).tree);
+		return { ...result, layerId: id };
+	}
+
+	public getHeadLayerId(): string {
+		return this.loadMeta().headLayerId;
+	}
+
+	public getProjectId(): string {
+		return this.projectId;
+	}
+
+	/** A store must never be applied to a different host working tree. */
+	private assertStoreMatchesSource(meta: StoreMetadata): void {
+		if (meta.sourceRoot && meta.sourceRoot !== this.sourceRoot) {
+			throw new Error(
+				`LayerFS store ${this.metaPath} belongs to ${meta.sourceRoot}; refusing to use it from ${this.sourceRoot}.`,
+			);
+		}
+	}
+
+	public getLayerTree(layerId: string): TreeManifest {
+		return this.loadLayer(layerId).tree;
+	}
+
+	/**
+	 * One-click rollback of the LAST published layer: restores the host pre-image
+	 * captured before the delta was applied and resets the store head to the parent.
+	 */
+	public rollbackPublishedLayer(layerId?: string): {
+		ok: boolean;
+		restoredLayerId?: string;
+		hostMatchesLayer?: boolean;
+		message: string;
+	} {
+		const meta = this.loadMeta();
+		const target = layerId ?? meta.headLayerId;
+		if (!target) return { ok: false, message: "No published layer to roll back." };
+		if (target !== meta.headLayerId) {
+			return {
+				ok: false,
+				message: `Cannot roll back ${target}: it is not the head layer (${meta.headLayerId}). Only the latest layer can be rolled back.`,
+			};
+		}
+		const snapshot = this.loadHostSnapshot(target);
+		if (!snapshot) {
+			return {
+				ok: false,
+				message: `No host pre-image snapshot found for ${target}; refusing to roll back blindly.`,
+			};
+		}
+		const layer = this.loadLayer(target);
+		if (!layer.parentLayerId) {
+			return { ok: false, message: `Layer ${target} has no parent layer; refusing to roll back.` };
+		}
+		this.restoreHostSnapshot(snapshot);
+		meta.headLayerId = layer.parentLayerId;
+		this.saveMeta(meta);
+		const verification = this.verifyHostMatchesLayer(meta.headLayerId);
+		return {
+			ok: true,
+			restoredLayerId: meta.headLayerId,
+			hostMatchesLayer: verification.matches,
+			message:
+				`Rolled back layer ${target}: host restored from pre-image snapshot, head is now ${meta.headLayerId}. ` +
+				`The rolled-back layer stays in the store for audit.`,
 		};
 	}
 
@@ -904,6 +1295,7 @@ export class LayerFSEngine {
 			storedBytes: meta.storedBytes,
 			savedBytes,
 			dedupRatio,
+			headLayerId: meta.headLayerId,
 		};
 	}
 

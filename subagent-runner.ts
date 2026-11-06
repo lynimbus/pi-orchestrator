@@ -26,6 +26,8 @@ export interface SubagentDispatchOptions {
 	maxConcurrency: number;
 	signal?: AbortSignal;
 	onProgress?: () => void;
+	/** Hard timeout for a single worker process (default 15 minutes) */
+	workerTimeoutMs?: number;
 }
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
@@ -254,6 +256,7 @@ export async function runWaveTaskSubagent(
 	const allowedCombined = [...spec.allowedFiles, ...spec.testFiles];
 	let lastAssistantText = "";
 	let stderrBuf = "";
+	const workerTimeoutMs = options.workerTimeoutMs ?? 15 * 60 * 1000;
 
 	try {
 		const exitCode = await new Promise<number>((resolve) => {
@@ -273,6 +276,45 @@ export async function runWaveTaskSubagent(
 			});
 
 			let stdoutLineBuf = "";
+			let settled = false;
+			let forcedExitCode: number | undefined;
+			let killTimer: ReturnType<typeof setTimeout> | undefined;
+			let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+			let killProc: (() => void) | undefined;
+
+			const finish = (code: number) => {
+				if (settled) return;
+				settled = true;
+				if (killTimer) clearTimeout(killTimer);
+				if (timeoutTimer) clearTimeout(timeoutTimer);
+				if (options.signal && killProc) {
+					options.signal.removeEventListener("abort", killProc);
+				}
+				if (stdoutLineBuf.trim()) processJsonLine(stdoutLineBuf);
+				resolve(code);
+			};
+
+			// SIGTERM first, unconditional SIGKILL escalation afterwards. `proc.killed`
+			// is already true right after the first kill(), so it must not be used as the
+			// guard (that used to leave hung workers alive forever).
+			const terminate = (code: number, label: string) => {
+				if (settled || forcedExitCode !== undefined) return;
+				forcedExitCode = code;
+				stderrBuf += `\n[${label}]`;
+				try {
+					proc.kill("SIGTERM");
+				} catch {
+					finish(code);
+					return;
+				}
+				killTimer = setTimeout(() => {
+					try {
+						proc.kill("SIGKILL");
+					} catch {
+						finish(code);
+					}
+				}, 3000);
+			};
 
 			const processJsonLine = (line: string) => {
 				if (!line.trim()) return;
@@ -315,6 +357,10 @@ export async function runWaveTaskSubagent(
 
 			proc.stdout.on("data", (chunk: Buffer) => {
 				stdoutLineBuf += chunk.toString("utf-8");
+				// Cap a pathological single-line (no newline) JSON stream.
+				if (stdoutLineBuf.length > 256 * 1024) {
+					stdoutLineBuf = stdoutLineBuf.slice(-64 * 1024);
+				}
 				const lines = stdoutLineBuf.split("\n");
 				stdoutLineBuf = lines.pop() || "";
 				for (const l of lines) processJsonLine(l);
@@ -325,27 +371,26 @@ export async function runWaveTaskSubagent(
 				if (stderrBuf.length > 16384) stderrBuf = stderrBuf.slice(-16384);
 			});
 
-			proc.on("close", (code) => {
-				if (stdoutLineBuf.trim()) processJsonLine(stdoutLineBuf);
-				resolve(code ?? 1);
-			});
+			proc.on("close", (code) => finish(forcedExitCode ?? code ?? 1));
+			proc.on("error", () => finish(1));
 
-			proc.on("error", () => resolve(1));
+			timeoutTimer = setTimeout(
+				() => terminate(124, `Worker timeout after ${workerTimeoutMs}ms: SIGTERM`),
+				workerTimeoutMs,
+			);
 
 			if (options.signal) {
-				const killProc = () => {
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 3000);
-				};
+				killProc = () => terminate(130, "Aborted by signal: SIGTERM");
 				if (options.signal.aborted) killProc();
 				else options.signal.addEventListener("abort", killProc, { once: true });
 			}
 		});
 
 		if (exitCode !== 0 && !lastAssistantText) {
-			state.lastError = stderrBuf.trim() || `Subagent exited with code ${exitCode}`;
+			state.lastError =
+				exitCode === 124
+					? `Subagent timed out after ${workerTimeoutMs}ms`
+					: stderrBuf.trim() || `Subagent exited with code ${exitCode}`;
 		}
 
 		// Commit workspace state via Compare-And-Swap on the LayerFS branch

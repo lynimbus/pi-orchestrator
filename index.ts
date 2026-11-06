@@ -38,6 +38,12 @@ import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { LayerFSEngine, matchesAnyPattern } from "./layerfs-engine.ts";
 import {
+	decideIntegrationAction,
+	decideRetryIntegrationAction,
+	decideRollbackIntegrationAction,
+	reconcileIntegrationRecord,
+} from "./integration-state.ts";
+import {
 	createEmptyUsageStats,
 	mapWithConcurrencyLimit,
 	runWaveTaskSubagent,
@@ -47,8 +53,13 @@ import type {
 	OrchestratorConfig,
 	TaskRecord,
 	TaskSpec,
+	TaskStatus,
 } from "./types.ts";
-import { executeWorkspaceCommand } from "./verifier.ts";
+import {
+	type CommandResult,
+	executeWorkspaceCommand,
+	formatCommandDiagnostics,
+} from "./verifier.ts";
 
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
@@ -231,6 +242,39 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		return new LayerFSEngine(cwd, activePlan?.projectId);
 	}
 
+	interface StatusDiagnostics {
+		hostVerification?: {
+			matches: boolean;
+			mismatches: string[];
+			checked: number;
+			layerId: string;
+		};
+		headFileCount?: number;
+		parentFileCount?: number;
+		treeRegression?: boolean;
+	}
+
+	/** Cheap, non-throwing consistency diagnostics for `/orch status`. */
+	function collectStatusDiagnostics(engine: LayerFSEngine): StatusDiagnostics {
+		const diag: StatusDiagnostics = {};
+		try {
+			const headLayerId = engine.getHeadLayerId();
+			if (!headLayerId) return diag;
+			diag.headFileCount = Object.keys(engine.getLayerTree(headLayerId)).length;
+			const headLayer = engine.loadLayer(headLayerId);
+			if (headLayer.parentLayerId) {
+				diag.parentFileCount = Object.keys(
+					engine.getLayerTree(headLayer.parentLayerId),
+				).length;
+				diag.treeRegression = diag.headFileCount < diag.parentFileCount;
+			}
+			if (activePlan) diag.hostVerification = engine.verifyHostMatchesLayer(headLayerId);
+		} catch {
+			// status reporting must never fail the tool call
+		}
+		return diag;
+	}
+
 	function resolveEffectiveSubagentModel(ctx: ExtensionContext): string | undefined {
 		if (config.subagentModel && config.subagentModel !== "inherit") {
 			return config.subagentModel;
@@ -279,6 +323,11 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				ctx.ui.theme.fg("accent", ctx.ui.theme.bold(`⚡ Orchestrator Plan: ${activePlan.goal}`)) +
 					ctx.ui.theme.fg("dim", `  [Base Layer: ${activePlan.baseLayerId} | Phase: ${activePlan.phase}]`),
 			);
+			if (activePlan.integration) {
+				lines.push(
+					ctx.ui.theme.fg("dim", `  Integration: ${activePlan.integration.status} | Layer: ${activePlan.integration.publishedLayerId ?? "(none)"} | test exit: ${activePlan.integration.testExitCode ?? "unknown"}`),
+				);
+			}
 
 			for (let wIdx = 0; wIdx < activePlan.waves.length; wIdx++) {
 				const waveIds = activePlan.waves[wIdx];
@@ -385,6 +434,23 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			}),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			// Registering a second plan while one is active silently discards the old
+			// plan state (and re-imports a possibly changed host tree). Refuse instead.
+			if (activePlan && activePlan.phase !== "COMPLETED") {
+				return {
+					content: [
+						{
+							type: "text",
+							text: [
+								`⛔ A plan is already active (phase ${activePlan.phase}, Wave ${activePlan.currentWaveIndex + 1}/${activePlan.waves.length}).`,
+								"Calling `orch_plan` again would abandon it and can lose already published work.",
+								"Finish the current plan, or use `/orch reset` (and verify the host tree) before registering a new one.",
+							].join("\n"),
+						},
+					],
+					isError: true,
+				};
+			}
 			const normalizedTasks: TaskSpec[] = params.tasks.map((t) => ({
 				id: t.id.trim(),
 				title: t.title.trim(),
@@ -490,7 +556,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				waves,
 				currentWaveIndex: 0,
 				baseLayerId: baseLayer.layerId,
-				projectId: undefined as any,
+				projectId: engine.getProjectId(),
 				tasks: taskRecords,
 			};
 
@@ -515,11 +581,14 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 						type: "text",
 						text: [
 							`✓ Orchestration Plan Registered (${normalizedTasks.length} tasks, ${waves.length} wave(s))`,
-							`- LayerFS Base Layer: \`${baseLayer.layerId}\` (${Object.keys(baseLayer.tree).length} tracked files)`,
+							`- LayerFS Base Layer: \`${baseLayer.layerId}\` (${Object.keys(baseLayer.tree).length} files scanned from the host working tree, including untracked files)`,
+							baseLayer.treeRegressionWarning ? `⚠ ${baseLayer.treeRegressionWarning}` : "",
 							...waveLines,
 							"",
 							nextInstruction,
-						].join("\n"),
+						]
+							.filter(Boolean)
+							.join("\n"),
 					},
 				],
 				details: { plan: activePlan },
@@ -555,7 +624,22 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			}
 
 			const engine = getEngine(ctx.cwd);
-			const newLayer = engine.importHostAsLayer(`Wave 0: ${params.message}`);
+			let newLayer;
+			try {
+				newLayer = engine.importHostAsLayer(`Wave 0: ${params.message}`, {
+					expectedParentLayerId: activePlan.baseLayerId,
+				});
+			} catch (err) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `✗ Wave 0 commit refused: ${err instanceof Error ? err.message : String(err)}. Use \`/orch reset\` if the store diverged.`,
+						},
+					],
+					isError: true,
+				};
+			}
 			activePlan.baseLayerId = newLayer.layerId;
 			activePlan.wave0Completed = true;
 			activePlan.phase = "READY_TO_DISPATCH";
@@ -571,7 +655,13 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				content: [
 					{
 						type: "text",
-						text: `✓ Wave 0 committed as LayerFS Layer \`${newLayer.layerId}\`.\nNext step: Call \`orch_dispatch\` to run Wave 1 (${activePlan.waves[0].join(", ")}).`,
+						text: [
+							`✓ Wave 0 committed as LayerFS Layer \`${newLayer.layerId}\` (${Object.keys(newLayer.tree).length} files).`,
+							newLayer.treeRegressionWarning ? `⚠ ${newLayer.treeRegressionWarning}` : "",
+							`Next step: Call \`orch_dispatch\` to run Wave 1 (${activePlan.waves[0].join(", ")}).`,
+						]
+							.filter(Boolean)
+							.join("\n"),
 					},
 				],
 			};
@@ -606,6 +696,17 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 						{
 							type: "text",
 							text: "Wave 0 is not yet committed. Finish editing wave0Files and call orch_wave0_commit first.",
+						},
+					],
+					isError: true,
+				};
+			}
+			if (activePlan.phase !== "READY_TO_DISPATCH") {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Cannot dispatch in phase ${activePlan.phase}. Approve/reject the current wave with \`orch_review\` first, or use \`orch_retry_integration\` / \`orch_rollback_integration\` after a merge.`,
 						},
 					],
 					isError: true,
@@ -717,7 +818,17 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 						`### 1. Mechanical Gate Checklist`,
 						gateSummary,
 						"",
-						`### 2. Test Runner Output Tail`,
+						`### 2. Test Runner Output`,
+						`- Environment: ${gate?.testCommandResult.environment ?? "(unknown)"}`,
+						gate?.testCommandResult.failureLines?.length
+							? `- Failure signatures: ${gate.testCommandResult.failureLines.slice(0, 12).join(" | ")}`
+							: "",
+						`- Cleaned stray root artifacts: ${gate?.testCommandResult.strayArtifacts?.length ? gate.testCommandResult.strayArtifacts.join(", ") : "none"}`,
+						"**Head**",
+						"```",
+						gate?.testCommandResult.outputHead || "(no output)",
+						"```",
+						"**Tail**",
 						"```",
 						gate?.testCommandResult.outputTail || "(no output)",
 						"```",
@@ -832,6 +943,27 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 					isError: true,
 				};
 			}
+			// Re-approving an already merged wave could flip the phase back to
+			// READY_TO_INTEGRATE and open the door to a duplicate merge.
+			// READY_TO_INTEGRATE is kept available so a task can still be rejected
+			// (e.g. after a merge conflict) before any Layer has been published.
+			// INTEGRATING / INTEGRATION_FAILED / COMPLETED are blocked: re-approving a
+			// merged wave could flip the phase back and allow a duplicate merge.
+			if (
+				activePlan.phase !== "REVIEWING" &&
+				activePlan.phase !== "READY_TO_DISPATCH" &&
+				activePlan.phase !== "READY_TO_INTEGRATE"
+			) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Cannot review tasks in phase ${activePlan.phase}. Reviews are only accepted while a wave is REVIEWING, READY_TO_DISPATCH or READY_TO_INTEGRATE.`,
+						},
+					],
+					isError: true,
+				};
+			}
 
 			const currentWaveIds = activePlan.waves[activePlan.currentWaveIndex] ?? [];
 			const messages: string[] = [];
@@ -935,13 +1067,93 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	// =========================================================================
+	// Integration state machine (idempotency, crash recovery, retry, rollback)
+	// =========================================================================
+
+	/** Reconcile a plan interrupted mid-integration (pure logic in integration-state.ts). */
+	function reconcileIntegrationState(engine: LayerFSEngine, ctx: ExtensionContext): void {
+		if (!activePlan) return;
+		if (reconcileIntegrationRecord(activePlan, engine.getHeadLayerId())) {
+			persistState();
+			updateUI(ctx);
+		}
+	}
+
+	/** Scratch dirs for host-side integration tests live in the LayerFS store, not the repo. */
+	function integrationScratchRoot(engine: LayerFSEngine): string {
+		return path.join(engine.getMetrics().storeRoot, "integration-scratch");
+	}
+
+	function markWaveMerged(publishedLayerId: string): void {
+		const plan = activePlan!;
+		const waveIds = plan.waves[plan.currentWaveIndex] ?? [];
+		const before: Record<string, TaskStatus> = {};
+		for (const id of waveIds) {
+			before[id] = plan.tasks[id].state.status;
+			plan.tasks[id].state.status = "merged";
+		}
+		plan.baseLayerId = publishedLayerId;
+		if (plan.integration) plan.integration.taskStatusesBeforeMerge = before;
+	}
+
+	function finalizeWaveAfterPassingTests(
+		result: CommandResult,
+		ctx: ExtensionContext,
+		viaRetry: boolean,
+	): string {
+		const plan = activePlan!;
+		const waveIdx = plan.currentWaveIndex;
+		const rec = plan.integration!;
+		rec.status = "passed";
+		rec.updatedAt = Date.now();
+		rec.testCommand = result.command;
+		rec.testExitCode = result.exitCode;
+		rec.testDurationMs = result.durationMs;
+		rec.testDiagnostics = undefined;
+		rec.lastError = undefined;
+
+		const metrics = getEngine(ctx.cwd).getMetrics();
+		const metricsLine = `- LayerFS: ${metrics.layerCount} layers, ${metrics.objectCount} objects, dedup ${metrics.dedupRatio}x`;
+		const hostLine = `- Published Layer: \`${rec.publishedLayerId ?? "(none)"}\` | Head: \`${metrics.headLayerId ?? "(none)"}\` | Host <-> Layer: ${rec.hostMatchesLayer === false ? "MISMATCH" : "MATCH"}`;
+
+		if (waveIdx < plan.waves.length - 1) {
+			const nextWave = waveIdx + 1;
+			plan.currentWaveIndex = nextWave;
+			plan.phase = "READY_TO_DISPATCH";
+			for (const id of plan.waves[nextWave]) {
+				plan.tasks[id].state.baseLayerId = plan.baseLayerId;
+			}
+			plan.integration = undefined;
+			persistState();
+			updateUI(ctx);
+			return [
+				`✓ Integration test \`${result.command}\` passed (${result.durationMs}ms)${viaRetry ? " on retry" : ""}.`,
+				hostLine,
+				metricsLine,
+				"",
+				`Wave ${waveIdx + 1} is merged. Next step: call \`orch_dispatch\` for Wave ${nextWave + 1} (${plan.waves[nextWave].join(", ")}).`,
+			].join("\n");
+		}
+
+		plan.phase = "COMPLETED";
+		persistState();
+		updateUI(ctx);
+		return [
+			`🎉 Orchestration COMPLETE — all ${plan.waves.length} wave(s) integrated.`,
+			`- Final integration test \`${result.command}\` passed (${result.durationMs}ms)${viaRetry ? " on retry" : ""}.`,
+			hostLine,
+			metricsLine,
+		].join("\n");
+	}
+
 	pi.registerTool({
 		name: "orch_integrate",
 		label: "Orchestrator: Integrate & Merge Wave",
 		description:
-			"Perform a deterministic LayerFS 3-way merge of all approved branches in the current wave, publish a new immutable Layer to the host directory, and run the integration test command.",
+			"Perform a deterministic LayerFS 3-way merge of all approved branches in the current wave, publish a new immutable Layer to the host directory, and run the integration test command. Idempotent: a wave that already published a Layer cannot be merged again.",
 		promptSnippet:
-			"Merge approved wave branches via LayerFS 3-way merge, publish to the host workspace, and run integration tests",
+			"Merge approved wave branches via LayerFS 3-way merge, publish to the host workspace, and run integration tests (once per wave)",
 		parameters: Type.Object({
 			commitMessage: Type.String({
 				description: "Summary message for the published LayerFS wave Layer",
@@ -955,13 +1167,46 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				};
 			}
 
-			const waveIdx = activePlan.currentWaveIndex;
-			const currentWaveIds = activePlan.waves[waveIdx] ?? [];
+			const engine = getEngine(ctx.cwd);
+			reconcileIntegrationState(engine, ctx);
+			const plan = activePlan!;
+			const storeHead = engine.getHeadLayerId();
+
+			// P0: never merge the same wave twice. The LayerFS head has already advanced
+			// past the branches' fork base; re-merging would publish a rollback Layer.
+			const decision = decideIntegrationAction(plan, storeHead);
+			if (decision.action !== "merge") {
+				const existing = plan.integration;
+				return {
+					content: [
+						{
+							type: "text",
+							text: [
+								decision.action === "no-op"
+									? "⛔ NO merge was performed: this wave is already integrated."
+									: "⛔ Integration blocked.",
+								`- Reason: ${decision.reason}`,
+								`- Published Layer: \`${existing?.publishedLayerId ?? "(none)"}\` | Store head: \`${storeHead}\``,
+								`- Last test: \`${existing?.testCommand ?? plan.integrationTestCommand}\` → exit ${existing?.testExitCode ?? "unknown"}`,
+								existing?.lastError ? `- Note: ${existing.lastError}` : "",
+								"",
+								"**Do NOT call `orch_integrate` again**: re-merging stale branches would publish a rollback layer and silently erase host changes.",
+								"Next: `orch_retry_integration` (re-run tests ONLY), `orch_rollback_integration` (undo the merge), or `/orch reset` + a new plan for a real code fix.",
+							]
+								.filter(Boolean)
+								.join("\n"),
+						},
+					],
+					isError: true,
+				};
+			}
+
+			const waveIdx = plan.currentWaveIndex;
+			const currentWaveIds = plan.waves[waveIdx] ?? [];
 			const notReady = currentWaveIds.filter((id) => {
-				const st = activePlan!.tasks[id].state.status;
+				const st = plan.tasks[id].state.status;
 				return st !== "approved" && st !== "escalated";
 			});
-
 			if (notReady.length > 0) {
 				return {
 					content: [
@@ -974,7 +1219,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				};
 			}
 
-			const isFinalWave = waveIdx === activePlan.waves.length - 1;
+			const isFinalWave = waveIdx === plan.waves.length - 1;
 			if (isFinalWave && config.requireHumanFinalApproval && ctx.hasUI) {
 				const ok = await ctx.ui.confirm(
 					"Publish Final Wave to Host Workspace?",
@@ -988,17 +1233,65 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				}
 			}
 
-			const engine = getEngine(ctx.cwd);
-			const approvedBranches = currentWaveIds
-				.filter((id) => activePlan!.tasks[id].state.status === "approved")
-				.map((id) => activePlan!.tasks[id].state.branchName);
+			const parentLayerId = plan.baseLayerId;
 
-			const mergeResult = engine.mergeAndPublishWave(approvedBranches, {
-				allowAutoThreeWayLineMerge: config.allowAutoThreeWayLineMerge,
-				message: `Wave ${waveIdx + 1}: ${params.commitMessage}`,
-			});
+			// Persist "running" BEFORE publishing anything: a crash can then be recovered
+			// by reconcileIntegrationState instead of allowing a duplicate merge.
+			plan.phase = "INTEGRATING";
+			plan.integration = {
+				status: "running",
+				waveIndex: waveIdx,
+				startedAt: Date.now(),
+				updatedAt: Date.now(),
+				attempts: 1,
+				parentLayerId,
+				testCommand: plan.integrationTestCommand,
+			};
+			persistState();
+			updateUI(ctx);
+
+			const approvedBranches = currentWaveIds
+				.filter((id) => plan.tasks[id].state.status === "approved")
+				.map((id) => plan.tasks[id].state.branchName);
+
+			let mergeResult;
+			try {
+				mergeResult = engine.mergeAndPublishWave(approvedBranches, {
+					allowAutoThreeWayLineMerge: config.allowAutoThreeWayLineMerge,
+					message: `Wave ${waveIdx + 1}: ${params.commitMessage}`,
+					expectedBaseLayerId: parentLayerId,
+				});
+			} catch (err) {
+				plan.phase = "READY_TO_INTEGRATE";
+				plan.integration = {
+					...plan.integration!,
+					status: "merge_failed",
+					lastError: err instanceof Error ? err.message : String(err),
+					updatedAt: Date.now(),
+				};
+				persistState();
+				updateUI(ctx);
+				return {
+					content: [
+						{
+							type: "text",
+							text: `✗ LayerFS merge threw an error (no Layer published): ${err instanceof Error ? err.message : String(err)}`,
+						},
+					],
+					isError: true,
+				};
+			}
 
 			if (!mergeResult.ok) {
+				plan.phase = "READY_TO_INTEGRATE";
+				plan.integration = {
+					...plan.integration!,
+					status: "merge_failed",
+					lastError: mergeResult.error ?? "Unresolved merge conflicts",
+					updatedAt: Date.now(),
+				};
+				persistState();
+				updateUI(ctx);
 				const conflictText = mergeResult.conflicts
 					.map(
 						(c) =>
@@ -1007,51 +1300,190 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 							}`,
 					)
 					.join("\n");
-
 				return {
 					content: [
 						{
 							type: "text",
 							text: [
-								`✗ LayerFS 3-Way Merge Refused due to ${mergeResult.conflicts.length} conflict(s):`,
+								`✗ LayerFS 3-Way Merge Refused (no Layer published, host untouched):`,
+								mergeResult.error ? `**Reason**: ${mergeResult.error}` : "",
 								conflictText,
 								"",
-								`All branch workspaces remain intact. Use \`orch_review\` to reject one of the conflicting tasks with instructions to rebase/adjust, or escalate to resolve.`,
-							].join("\n"),
+								`All branch workspaces remain intact. Use \`orch_review\` to reject one of the conflicting tasks, or escalate to resolve.`,
+							]
+								.filter(Boolean)
+								.join("\n"),
 						},
 					],
 					isError: true,
 				};
 			}
 
-			// If any task was escalated and edited directly on the host, re-import host state as the latest Layer
-			if (currentWaveIds.some((id) => activePlan!.tasks[id].state.status === "escalated")) {
-				const reimported = engine.importHostAsLayer(
-					`Wave ${waveIdx + 1} (including escalated fixes): ${params.commitMessage}`,
-				);
-				mergeResult.publishedLayerId = reimported.layerId;
+			let publishedLayerId = mergeResult.publishedLayerId!;
+			const escalatedIds = currentWaveIds.filter(
+				(id) => plan.tasks[id].state.status === "escalated",
+			);
+			let reimportWarning = "";
+			if (escalatedIds.length > 0) {
+				try {
+					const reimported = engine.importHostAsLayer(
+						`Wave ${waveIdx + 1} escalated direct lead edits: ${params.commitMessage}`,
+						{ expectedParentLayerId: publishedLayerId },
+					);
+					publishedLayerId = reimported.layerId;
+					if (reimported.treeRegressionWarning) {
+						reimportWarning = `\n⚠ ${reimported.treeRegressionWarning}`;
+					}
+				} catch (err) {
+					reimportWarning = `\n⚠ Could not re-import escalated host edits: ${err instanceof Error ? err.message : String(err)}`;
+				}
 			}
 
-			// Run integration test command on the host workspace
+			// Commit the wave state BEFORE running tests. Even if the test command fails
+			// (or the process dies), plan and store remain consistent and no duplicate
+			// merge is possible.
+			markWaveMerged(publishedLayerId);
+			plan.integration = {
+				...plan.integration!,
+				status: "running",
+				publishedLayerId,
+				hostMatchesLayer: mergeResult.hostMatchesLayer,
+				hostMismatches: mergeResult.hostMismatches,
+				hostDrift: mergeResult.hostDrift,
+				updatedAt: Date.now(),
+			};
+			persistState();
+			updateUI(ctx);
+
 			const integrationResult = await executeWorkspaceCommand(
-				activePlan.integrationTestCommand,
+				plan.integrationTestCommand,
 				ctx.cwd,
 				signal,
 				180_000,
+				{ scratchRoot: integrationScratchRoot(engine) },
 			);
 
 			if (integrationResult.exitCode !== 0) {
+				plan.integration = {
+					...plan.integration!,
+					status: "failed",
+					updatedAt: Date.now(),
+					testCommand: integrationResult.command,
+					testExitCode: integrationResult.exitCode,
+					testDurationMs: integrationResult.durationMs,
+					testDiagnostics: formatCommandDiagnostics(integrationResult),
+					lastError: `Integration test exited ${integrationResult.exitCode}`,
+				};
+				plan.phase = "INTEGRATION_FAILED";
+				persistState();
+				updateUI(ctx);
 				return {
 					content: [
 						{
 							type: "text",
 							text: [
-								`⚠ LayerFS published Layer \`${mergeResult.publishedLayerId}\`, but the Integration Test Command FAILED (exit code ${integrationResult.exitCode}):`,
-								`Command: \`${activePlan.integrationTestCommand}\``,
-								"```",
-								integrationResult.outputTail,
-								"```",
-								"Inspect the integration failure and either re-open/reject the offending task or register a follow-up fix plan.",
+								`⚠ Wave ${waveIdx + 1} was MERGED and published as Layer \`${publishedLayerId}\` (host updated); the integration test FAILED with exit ${integrationResult.exitCode}.`,
+								`- Host <-> Layer verification: ${mergeResult.hostMatchesLayer ? "MATCH" : `MISMATCH (${(mergeResult.hostMismatches ?? []).slice(0, 5).join(", ")})`}`,
+								mergeResult.hostDrift?.length
+									? `- ⚠ Pre-existing host drift on untouched paths: ${mergeResult.hostDrift.slice(0, 5).join(", ")}`
+									: "",
+								`- Rollback snapshot: \`${mergeResult.rollbackSnapshotId ?? "(none)"}\``,
+								reimportWarning,
+								"",
+								formatCommandDiagnostics(integrationResult),
+								"",
+								"⛔ The plan is now `INTEGRATION_FAILED`. **Never call `orch_integrate` again for this wave.**",
+								"Next: `orch_retry_integration` (re-run tests ONLY), `orch_rollback_integration` (undo the merge), or `/orch reset` + a new plan to fix the code.",
+							]
+								.filter(Boolean)
+								.join("\n"),
+						},
+					],
+					isError: true,
+				};
+			}
+
+			return {
+				content: [
+					{
+						type: "text",
+						text:
+							finalizeWaveAfterPassingTests(integrationResult, ctx, false) + reimportWarning,
+					},
+				],
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "orch_retry_integration",
+		label: "Orchestrator: Retry Integration Tests Only",
+		description:
+			"Re-run the integration test command for a wave whose Layer was already published. NEVER re-merges branches, NEVER publishes another Layer, and NEVER modifies the host tree.",
+		promptSnippet:
+			"Retry only the integration test command after a failed integration (no merge, no publish)",
+		parameters: Type.Object({
+			command: Type.Optional(
+				Type.String({ description: "Optional override of the integration test command for this retry" }),
+			),
+		}),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			if (!activePlan) {
+				return {
+					content: [{ type: "text", text: "No active orchestration plan." }],
+					isError: true,
+				};
+			}
+			const engine = getEngine(ctx.cwd);
+			reconcileIntegrationState(engine, ctx);
+			const plan = activePlan!;
+			const retryDecision = decideRetryIntegrationAction(plan, engine.getHeadLayerId());
+			if (!retryDecision.allowed) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `⛔ Cannot retry integration: ${retryDecision.reason} Use \`orch_integrate\` first, or \`/orch reset\` for a new plan.`,
+						},
+					],
+					isError: true,
+				};
+			}
+			const rec = plan.integration!;
+
+			const hostCheck = engine.verifyHostMatchesLayer(rec.publishedLayerId);
+			const command = params.command?.trim() || plan.integrationTestCommand;
+			const result = await executeWorkspaceCommand(command, ctx.cwd, signal, 180_000, {
+				scratchRoot: integrationScratchRoot(engine),
+			});
+			rec.attempts += 1;
+			rec.updatedAt = Date.now();
+			rec.testCommand = result.command;
+			rec.testExitCode = result.exitCode;
+			rec.testDurationMs = result.durationMs;
+			rec.hostMatchesLayer = hostCheck.matches;
+			rec.hostMismatches = hostCheck.matches ? [] : hostCheck.mismatches;
+			rec.hostDrift = hostCheck.matches ? [] : hostCheck.mismatches;
+
+			if (result.exitCode !== 0) {
+				rec.status = "failed";
+				rec.testDiagnostics = formatCommandDiagnostics(result);
+				rec.lastError = `Integration test retry #${rec.attempts} exited ${result.exitCode}`;
+				plan.phase = "INTEGRATION_FAILED";
+				persistState();
+				updateUI(ctx);
+				return {
+					content: [
+						{
+							type: "text",
+							text: [
+								`⚠ Integration test retry #${rec.attempts} FAILED (exit ${result.exitCode}). No merge or publish was performed.`,
+								`- Published Layer: \`${rec.publishedLayerId}\` (unchanged)`,
+								`- Host <-> Layer: ${hostCheck.matches ? "MATCH" : `MISMATCH (${hostCheck.mismatches.slice(0, 5).join(", ")})`}`,
+								"",
+								formatCommandDiagnostics(result),
+								"",
+								"Next: `orch_retry_integration` again, `orch_rollback_integration`, or `/orch reset` + a new plan.",
 							].join("\n"),
 						},
 					],
@@ -1059,43 +1491,65 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				};
 			}
 
-			for (const id of currentWaveIds) {
-				activePlan.tasks[id].state.status = "merged";
+			rec.testDiagnostics = undefined;
+			return {
+				content: [
+					{ type: "text", text: finalizeWaveAfterPassingTests(result, ctx, true) },
+				],
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "orch_rollback_integration",
+		label: "Orchestrator: Roll Back Last Published Wave",
+		description:
+			"Restore the host working tree from the pre-integration snapshot, reset the LayerFS head to the parent Layer, and reopen the wave so it can be re-integrated or re-dispatched.",
+		promptSnippet:
+			"One-click rollback of the last published wave using the host pre-image snapshot",
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			if (!activePlan) {
+				return {
+					content: [{ type: "text", text: "No active orchestration plan." }],
+					isError: true,
+				};
 			}
-			if (mergeResult.publishedLayerId) {
-				activePlan.baseLayerId = mergeResult.publishedLayerId;
-			}
-
-			const metrics = mergeResult.storeMetrics;
-			const metricsLine = `LayerFS Store: ${metrics.layerCount} Layers, ${metrics.commitCount} Commits, ${metrics.objectCount} canonical blobs, dedup ratio ${metrics.dedupRatio}x (${formatBytes(metrics.savedBytes)} saved)`;
-
-			if (!isFinalWave) {
-				activePlan.currentWaveIndex += 1;
-				activePlan.phase = "READY_TO_DISPATCH";
-				const nextWaveIds = activePlan.waves[activePlan.currentWaveIndex];
-				for (const id of nextWaveIds) {
-					activePlan.tasks[id].state.baseLayerId = activePlan.baseLayerId;
-				}
-				persistState();
-				updateUI(ctx);
-
+			const engine = getEngine(ctx.cwd);
+			const plan = activePlan!;
+			const rollbackDecision = decideRollbackIntegrationAction(
+				plan,
+				engine.getHeadLayerId(),
+			);
+			if (!rollbackDecision.allowed) {
 				return {
 					content: [
 						{
 							type: "text",
-							text: [
-								`✓ Wave ${waveIdx + 1} Merged & Published as Layer \`${activePlan.baseLayerId}\` (${mergeResult.mergedFiles.length} file(s) updated).`,
-								`✓ Integration test \`${activePlan.integrationTestCommand}\` passed (${integrationResult.durationMs}ms).`,
-								`- ${metricsLine}`,
-								"",
-								`**Next step**: Call \`orch_dispatch\` to start **Wave ${activePlan.currentWaveIndex + 1}** (${nextWaveIds.join(", ")}).`,
-							].join("\n"),
+							text: `⛔ Cannot roll back: ${rollbackDecision.reason} Use \`/orch reset\` if you need a fresh plan.`,
 						},
 					],
+					isError: true,
+				};
+			}
+			const rec = plan.integration!;
+
+			const rollback = engine.rollbackPublishedLayer(rec.publishedLayerId);
+			if (!rollback.ok || !rollback.restoredLayerId) {
+				return {
+					content: [{ type: "text", text: `✗ Rollback refused: ${rollback.message}` }],
+					isError: true,
 				};
 			}
 
-			activePlan.phase = "COMPLETED";
+			for (const id of plan.waves[rec.waveIndex] ?? []) {
+				const previous = rec.taskStatusesBeforeMerge?.[id];
+				plan.tasks[id].state.status = previous === "escalated" ? "escalated" : "approved";
+			}
+			plan.baseLayerId = rollback.restoredLayerId;
+			plan.currentWaveIndex = rec.waveIndex;
+			plan.phase = "READY_TO_INTEGRATE";
+			plan.integration = undefined;
 			persistState();
 			updateUI(ctx);
 
@@ -1104,12 +1558,11 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 					{
 						type: "text",
 						text: [
-							`🎉 All ${activePlan.waves.length} Wave(s) Integrated & Verified!`,
-							`- Final Published LayerFS Layer: \`${activePlan.baseLayerId}\``,
-							`- Integration Test (\`${activePlan.integrationTestCommand}\`): PASSED in ${integrationResult.durationMs}ms`,
-							`- ${metricsLine}`,
+							`✓ ${rollback.message}`,
+							`- Host <-> Layer after rollback: ${rollback.hostMatchesLayer ? "MATCH" : "MISMATCH"}`,
+							`- Wave ${rec.waveIndex + 1} reopened as \`READY_TO_INTEGRATE\`; tasks are approved again.`,
 							"",
-							`You may now present the final summary of changes and unit tests to the user.`,
+							"Next: `orch_integrate` to re-merge from the parent Layer, or `orch_review` + `orch_dispatch` to revise the work first.",
 						].join("\n"),
 					},
 				],
@@ -1129,7 +1582,13 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				content: [
 					{
 						type: "text",
-						text: formatOrchestratorStatusReport(config, activePlan, metrics, ctx),
+						text: formatOrchestratorStatusReport(
+							config,
+							activePlan,
+							metrics,
+							ctx,
+							collectStatusDiagnostics(engine),
+						),
 					},
 				],
 			};
@@ -1148,7 +1607,10 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		const effectiveThinking = resolveEffectiveSubagentThinking(ctx) || "inherit";
 
 		const planSummary = activePlan
-			? `Active Plan: "${activePlan.goal}" | Phase: ${activePlan.phase} | Wave: ${activePlan.currentWaveIndex + 1}/${activePlan.waves.length} | Base Layer: ${activePlan.baseLayerId}`
+			? `Active Plan: "${activePlan.goal}" | Phase: ${activePlan.phase} | Wave: ${activePlan.currentWaveIndex + 1}/${activePlan.waves.length} | Base Layer: ${activePlan.baseLayerId}` +
+				(activePlan.integration
+					? ` | Integration: ${activePlan.integration.status} (Layer ${activePlan.integration.publishedLayerId ?? "none"})`
+					: "")
 			: "No active plan registered yet (Phase: IDLE).";
 
 		return {
@@ -1163,7 +1625,7 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 2. WAVE 0 (OPTIONAL): If tasks share common types/interfaces/stubs, declare those files in \`wave0Files\` in \`orch_plan\`, edit only those files during \`WAVE_0\`, and commit them with \`orch_wave0_commit\`.
 3. PARALLEL LAYERFS DISPATCH: Call \`orch_dispatch\` to run the current wave's tasks in parallel. Each subagent runs in an isolated LayerFS Branch Workspace, writes unit tests + implementation, and undergoes the Mechanical Verification Gate.
 4. DIFF & TEST REVIEW ONLY: Do NOT re-read the whole codebase after dispatch. Review ONLY the implementation diff, accompanying unit test diff, and Mechanical Gate report returned by \`orch_dispatch\`, then submit your decisions via \`orch_review\`.
-5. MERGE & INTEGRATE: Once all tasks in the wave are approved, call \`orch_integrate\` to perform the LayerFS 3-way merge, publish the new Layer, and run the integration test suite.`,
+5. MERGE & INTEGRATE (ONCE PER WAVE): Once all tasks in the wave are approved, call \`orch_integrate\` ONCE to perform the LayerFS 3-way merge, publish the new Layer, and run the integration test suite. If the integration test fails, the wave is already merged: NEVER call \`orch_integrate\` again (it would publish a rollback Layer and erase the host changes). Use \`orch_retry_integration\` (tests only), \`orch_rollback_integration\` (undo the merge), or \`/orch reset\` + a new plan.`,
 				display: false,
 			},
 		};
@@ -1242,7 +1704,13 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 				nextActionHint = `Call \`orch_review\` to approve, reject, or escalate the completed tasks in Wave ${activePlan.currentWaveIndex + 1}.`;
 				break;
 			case "READY_TO_INTEGRATE":
-				nextActionHint = `Call \`orch_integrate\` to merge Wave ${activePlan.currentWaveIndex + 1} and run the integration test suite.`;
+				nextActionHint = `Call \`orch_integrate\` ONCE to merge Wave ${activePlan.currentWaveIndex + 1} and run the integration test suite.`;
+				break;
+			case "INTEGRATING":
+				nextActionHint = `Integration for Wave ${activePlan.currentWaveIndex + 1} is still in progress; wait for the result.`;
+				break;
+			case "INTEGRATION_FAILED":
+				nextActionHint = `Wave ${activePlan.currentWaveIndex + 1} is already merged but its integration test failed. Do NOT call \`orch_integrate\` again. Use \`orch_retry_integration\` to re-run tests, \`orch_rollback_integration\` to undo the merge, or \`/orch reset\` + a new plan.`;
 				break;
 			default:
 				return;
@@ -1381,6 +1849,7 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 					activePlan,
 					engine.getMetrics(),
 					ctx,
+					collectStatusDiagnostics(engine),
 				);
 				ctx.ui.notify(report, "info");
 				return;
@@ -1556,6 +2025,7 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 				activePlan,
 				engine.getMetrics(),
 				ctx,
+				collectStatusDiagnostics(engine),
 			);
 			ctx.ui.notify(report, "info");
 		} else if (selected.startsWith("9.")) {
@@ -1615,11 +2085,24 @@ function formatBytes(bytes: number): string {
 	return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
+interface StatusReportDiagnostics {
+	hostVerification?: {
+		matches: boolean;
+		mismatches: string[];
+		checked: number;
+		layerId: string;
+	};
+	headFileCount?: number;
+	parentFileCount?: number;
+	treeRegression?: boolean;
+}
+
 function formatOrchestratorStatusReport(
 	config: OrchestratorConfig,
 	plan: OrchestrationPlan | null,
 	metrics: ReturnType<LayerFSEngine["getMetrics"]>,
 	ctx: ExtensionContext,
+	diag?: StatusReportDiagnostics,
 ): string {
 	const leadModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown";
 	const lines: string[] = [
@@ -1634,6 +2117,26 @@ function formatOrchestratorStatusReport(
 		`  Logical: ${formatBytes(metrics.logicalBytes)} | Stored: ${formatBytes(metrics.storedBytes)} | Dedup: ${metrics.dedupRatio}x (${formatBytes(metrics.savedBytes)} saved)`,
 	];
 
+	if (diag) {
+		lines.push(
+			`- Last Published / Head Layer: \`${metrics.headLayerId || "(none)"}\` (${diag.headFileCount ?? 0} files)`,
+		);
+		if (diag.parentFileCount !== undefined) {
+			lines.push(
+				`  Parent Layer: ${diag.parentFileCount} files` +
+					(diag.treeRegression
+						? "  ⚠ TREE REGRESSION: head layer has FEWER files than its parent (possible rollback / lost changes)"
+						: ""),
+			);
+		}
+		if (diag.hostVerification) {
+			const hv = diag.hostVerification;
+			lines.push(
+				`  Host <-> Layer: ${hv.matches ? "MATCH" : `MISMATCH (${hv.mismatches.slice(0, 5).join(", ")})`} (${hv.checked} files checked)`,
+			);
+		}
+	}
+
 	if (!plan) {
 		lines.push(`- Active Plan: None`);
 	} else {
@@ -1646,6 +2149,20 @@ function formatOrchestratorStatusReport(
 				return `${id}[${rec.state.status}, tries=${rec.state.attempts}]`;
 			});
 			lines.push(`  Wave ${i + 1}: ${taskSummaries.join(", ")}`);
+		}
+		if (plan.integration) {
+			const it = plan.integration;
+			lines.push(
+				`- Integration: ${it.status} (Wave ${it.waveIndex + 1}) | Layer \`${it.publishedLayerId ?? "(none)"}\` | test exit ${it.testExitCode ?? "unknown"} | attempts ${it.attempts}`,
+			);
+			if (it.lastError) lines.push(`  Last error: ${it.lastError}`);
+			if (it.testCommand) lines.push(`  Last test command: \`${it.testCommand}\``);
+			if (!it.hostMatchesLayer && it.hostMismatches?.length) {
+				lines.push(`  ⚠ Host <-> Layer mismatch on merged paths: ${it.hostMismatches.slice(0, 5).join(", ")}`);
+			}
+			if (it.hostDrift?.length) {
+				lines.push(`  ⚠ Host <-> Layer drift on untouched paths: ${it.hostDrift.slice(0, 5).join(", ")}`);
+			}
 		}
 	}
 

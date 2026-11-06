@@ -11,6 +11,8 @@
  */
 
 import { spawn } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { isTestFilePath, matchesAnyPattern } from "./layerfs-engine.ts";
 import type {
@@ -127,6 +129,9 @@ export async function runMechanicalVerificationGate(
 		workspacePath,
 		signal,
 		120_000,
+		// Worker workspaces are ephemeral: remove junk files (e.g. a stray "-" file
+		// produced by a misbehaving mock) so they cannot leak into later commits.
+		{ cleanupStrayRootFiles: true },
 	);
 	const testExecPassed = testCmdResult.exitCode === 0;
 	const testExecDetails = testExecPassed
@@ -190,20 +195,109 @@ export async function runMechanicalVerificationGate(
 	};
 }
 
+export interface CommandResult {
+	command: string;
+	exitCode: number;
+	durationMs: number;
+	outputTail: string;
+	/** First lines, captured before the rolling tail buffer drops them */
+	outputHead: string;
+	/** Diagnostic lines matching failure signatures from the whole output */
+	failureLines: string[];
+	/** cwd + scratch directory summary (so a bad TMPDIR is visible in failure reports) */
+	environment: string;
+	/** Junk files created in the workspace root by the test command and removed */
+	strayArtifacts: string[];
+}
+
+const COMMAND_HEAD_LIMIT = 16 * 1024;
+const COMMAND_TAIL_LIMIT = 64 * 1024;
+const FAILURE_LINE_REGEX =
+	/(\b(fail|failed|failure|fatal|error|panic|assert(ion)?|traceback|exception|aborted|not found|no such file|permission denied|mktemp|exit code|exit status|killed|timed out|cannot|unable to)\b|\u2717|\u274c|\[FAIL\]|FAILED|ERROR:)/i;
+const FALSE_POSITIVE_LINE_REGEX =
+	/(\b0\s+(failed|failures?|errors?)\b|all\s+.{0,24}\s+passed|no failures|passed\s*$)/i;
+
+/**
+ * The scratch directory handed to TMPDIR/XDG_CACHE_HOME MUST exist and be writable.
+ * LayerFS workspaces create it, but the host workspace used by integration tests does
+ * not -- which used to make plain `mktemp` fail with a bogus ENOENT.
+ */
+function ensureScratchDir(preferred: string, label: string): string {
+	try {
+		fs.mkdirSync(preferred, { recursive: true });
+		fs.accessSync(preferred, fs.constants.W_OK);
+		return preferred;
+	} catch {
+		return fs.mkdtempSync(path.join(os.tmpdir(), `orch-${label}-`));
+	}
+}
+
+function rootFileSnapshot(dir: string): Set<string> {
+	const names = new Set<string>();
+	try {
+		for (const name of fs.readdirSync(dir)) {
+			try {
+				const stat = fs.lstatSync(path.join(dir, name));
+				if (stat.isFile() || stat.isSymbolicLink()) names.add(name);
+			} catch {
+				// ignore races on individual entries
+			}
+		}
+	} catch {
+		// workspace may not be readable -- nothing to compare
+	}
+	return names;
+}
+
+/** Human-readable report used whenever a command fails. Keeps head + failure lines + tail. */
+export function formatCommandDiagnostics(result: CommandResult): string {
+	return [
+		`Command: \`${result.command}\``,
+		`Exit code: ${result.exitCode} | Duration: ${result.durationMs}ms`,
+		`Environment: ${result.environment}`,
+		"",
+		"### Failure signatures (extracted from the full output)",
+		result.failureLines.length
+			? result.failureLines.slice(0, 80).map((line) => `- ${line}`).join("\n")
+			: "(no failure signatures matched)",
+		"",
+		"### Output head",
+		"```",
+		result.outputHead || "(no output)",
+		"```",
+		"",
+		"### Output tail",
+		"```",
+		result.outputTail || "(no output)",
+		"```",
+		...(result.strayArtifacts.length
+			? ["", "### Cleaned stray workspace-root artifacts", ...result.strayArtifacts.map((f) => `- ${f}`)]
+			: []),
+	].join("\n");
+}
+
 export async function executeWorkspaceCommand(
 	command: string,
 	workspacePath: string,
 	signal?: AbortSignal,
 	timeoutMs = 120_000,
-): Promise<{
-	command: string;
-	exitCode: number;
-	durationMs: number;
-	outputTail: string;
-}> {
+	options: { cleanupStrayRootFiles?: boolean; scratchRoot?: string } = {},
+): Promise<CommandResult> {
 	const start = Date.now();
-	const tmpDir = path.join(workspacePath, ".tmp");
-	const cacheDir = path.join(workspacePath, ".cache");
+	// Integration tests run against the HOST workspace: keep scratch dirs outside
+	// the repo so TMPDIR works without polluting the host working tree.
+	const scratchRoot = options.scratchRoot ?? workspacePath;
+	const tmpDir = ensureScratchDir(path.join(scratchRoot, ".tmp"), "tmp");
+	const cacheDir = ensureScratchDir(path.join(scratchRoot, ".cache"), "cache");
+	const environment = [
+		`cwd=${workspacePath}`,
+		`TMPDIR=${tmpDir}`,
+		`XDG_CACHE_HOME=${cacheDir}`,
+		"CI=1",
+	].join(" | ");
+	const rootFilesBefore = options.cleanupStrayRootFiles
+		? rootFileSnapshot(workspacePath)
+		: new Set<string>();
 
 	return new Promise((resolve) => {
 		const proc = spawn("bash", ["-c", command], {
@@ -212,64 +306,128 @@ export async function executeWorkspaceCommand(
 			env: {
 				...process.env,
 				TMPDIR: tmpDir,
+				TMP: tmpDir,
+				TEMP: tmpDir,
 				XDG_CACHE_HOME: cacheDir,
 				CI: "1",
 			},
 		});
 
 		let combined = "";
-		const maxBuffer = 64 * 1024;
-		const appendChunk = (data: Buffer) => {
-			combined += data.toString("utf-8");
-			if (combined.length > maxBuffer) {
-				combined = combined.slice(combined.length - maxBuffer);
+		let head = "";
+		let pendingLine = "";
+		const failureLines: string[] = [];
+		const appendText = (text: string) => {
+			combined += text;
+			if (combined.length > COMMAND_TAIL_LIMIT) {
+				combined = combined.slice(combined.length - COMMAND_TAIL_LIMIT);
+			}
+			if (head.length < COMMAND_HEAD_LIMIT) {
+				head += text.slice(0, COMMAND_HEAD_LIMIT - head.length);
+			}
+			pendingLine += text;
+			const parts = pendingLine.split("\n");
+			pendingLine = parts.pop() ?? "";
+			for (const line of parts) {
+				const trimmed = line.trim();
+				if (
+					trimmed.length > 0 &&
+					failureLines.length < 200 &&
+					FAILURE_LINE_REGEX.test(trimmed) &&
+					!FALSE_POSITIVE_LINE_REGEX.test(trimmed)
+				) {
+					failureLines.push(trimmed.slice(0, 400));
+				}
 			}
 		};
+		const appendChunk = (data: Buffer) => appendText(data.toString("utf-8"));
 
 		proc.stdout.on("data", appendChunk);
 		proc.stderr.on("data", appendChunk);
 
 		let settled = false;
+		// Declared before `finish` so an already-aborted signal cannot hit a TDZ error.
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let killTimer: ReturnType<typeof setTimeout> | undefined;
+		let forcedExitCode: number | undefined;
+		let onAbort: (() => void) | undefined;
+
 		const finish = (exitCode: number) => {
 			if (settled) return;
 			settled = true;
-			clearTimeout(timer);
+			if (timer) clearTimeout(timer);
+			if (killTimer) clearTimeout(killTimer);
+			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+			if (pendingLine.trim() && failureLines.length < 200) {
+				const trimmed = pendingLine.trim();
+				if (FAILURE_LINE_REGEX.test(trimmed) && !FALSE_POSITIVE_LINE_REGEX.test(trimmed)) {
+					failureLines.push(trimmed.slice(0, 400));
+				}
+			}
+
+			const strayArtifacts: string[] = [];
+			if (options.cleanupStrayRootFiles) {
+				for (const name of rootFileSnapshot(workspacePath)) {
+					if (rootFilesBefore.has(name) || name.startsWith(".")) continue;
+					const full = path.join(workspacePath, name);
+					try {
+						if (!fs.lstatSync(full).isFile()) continue;
+						fs.rmSync(full, { force: true });
+						strayArtifacts.push(name);
+					} catch {
+						// never let cleanup break test reporting
+					}
+				}
+			}
+
 			const lines = combined.trim().split("\n");
-			const tail = lines.slice(-40).join("\n");
 			resolve({
 				command,
 				exitCode,
 				durationMs: Date.now() - start,
-				outputTail: tail || "(no output)",
+				outputTail: lines.slice(-40).join("\n") || "(no output)",
+				outputHead: head.split("\n").slice(0, 40).join("\n") || "(no output)",
+				failureLines,
+				environment,
+				strayArtifacts,
 			});
 		};
 
-		const timer = setTimeout(() => {
-			proc.kill("SIGTERM");
-			setTimeout(() => {
-				if (!proc.killed) proc.kill("SIGKILL");
-			}, 2000);
-			combined += `\n[Timeout after ${timeoutMs}ms]`;
-			finish(124);
-		}, timeoutMs);
-
-		if (signal) {
-			const onAbort = () => {
+		// Terminate first, resolve on "close" -- never leave an orphan process behind.
+		const terminate = (code: number, label: string) => {
+			if (settled || forcedExitCode !== undefined) return;
+			forcedExitCode = code;
+			appendText(`\n[${label}]`);
+			try {
 				proc.kill("SIGTERM");
-				combined += "\n[Aborted by signal]";
-				finish(130);
-			};
-			if (signal.aborted) {
-				onAbort();
+			} catch {
+				finish(code);
 				return;
 			}
-			signal.addEventListener("abort", onAbort, { once: true });
+			killTimer = setTimeout(() => {
+				try {
+					proc.kill("SIGKILL");
+				} catch {
+					finish(code);
+				}
+			}, 2000);
+		};
+
+		timer = setTimeout(() => terminate(124, `Timeout after ${timeoutMs}ms: SIGTERM`), timeoutMs);
+
+		if (signal) {
+			onAbort = () => terminate(130, "Aborted by signal: SIGTERM");
+			if (signal.aborted) {
+				onAbort();
+			} else {
+				signal.addEventListener("abort", onAbort, { once: true });
+			}
 		}
 
-		proc.on("close", (code) => finish(code ?? 1));
+		proc.on("close", (code) => finish(forcedExitCode ?? code ?? 1));
 		proc.on("error", (err) => {
-			combined += `\n[Process error: ${err.message}]`;
-			finish(1);
+			appendText(`\n[Process error: ${err.message}]`);
+			finish(127);
 		});
 	});
 }

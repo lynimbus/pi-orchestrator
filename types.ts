@@ -8,6 +8,8 @@ export type OrchestratorPhase =
 	| "DISPATCHING"
 	| "REVIEWING"
 	| "READY_TO_INTEGRATE"
+	| "INTEGRATING"
+	| "INTEGRATION_FAILED"
 	| "COMPLETED";
 
 export type TaskStatus =
@@ -118,6 +120,14 @@ export interface MechanicalGateReport {
 		exitCode: number;
 		durationMs: number;
 		outputTail: string;
+		/** First lines of the command output (never truncated away by the rolling tail buffer) */
+		outputHead?: string;
+		/** Lines matching known failure signatures, extracted from the whole output */
+		failureLines?: string[];
+		/** Human-readable environment summary, e.g. TMPDIR / XDG_CACHE_HOME / cwd */
+		environment?: string;
+		/** Files created in the workspace root by the test command and cleaned up afterwards */
+		strayArtifacts?: string[];
 	};
 	outOfScopeFiles: string[];
 	touchedTestFiles: string[];
@@ -168,6 +178,36 @@ export interface TaskRecord {
 	state: TaskRuntimeState;
 }
 
+/**
+ * Durable record of a wave integration attempt.
+ *
+ * This is the single source of truth used to make `orch_integrate` idempotent:
+ * once a wave has published a Layer, a second `orch_integrate` must never merge
+ * the same (now stale) branches again.
+ */
+export interface IntegrationRecord {
+	status: "running" | "merge_failed" | "failed" | "passed";
+	waveIndex: number;
+	startedAt: number;
+	updatedAt: number;
+	attempts: number;
+	/** Set as soon as the LayerFS merge publishes a layer (even if tests later fail) */
+	publishedLayerId?: string;
+	/** Parent of the published layer; used by `orch_rollback_integration` */
+	parentLayerId?: string;
+	hostMatchesLayer?: boolean;
+	hostMismatches?: string[];
+	/** Non-fatal drift on layer paths not touched by this wave */
+	hostDrift?: string[];
+	testCommand?: string;
+	testExitCode?: number;
+	testDurationMs?: number;
+	testDiagnostics?: string;
+	lastError?: string;
+	/** Task statuses before `markWaveMerged`, used by `orch_rollback_integration` */
+	taskStatusesBeforeMerge?: Record<string, TaskStatus>;
+}
+
 export interface OrchestrationPlan {
 	planId: string;
 	goal: string;
@@ -181,6 +221,8 @@ export interface OrchestrationPlan {
 	baseLayerId: string;
 	projectId: string;
 	tasks: Record<string, TaskRecord>;
+	/** Integration state of the current wave (undefined until the first integrate call) */
+	integration?: IntegrationRecord;
 }
 
 export interface MergeConflictItem {
@@ -194,7 +236,18 @@ export interface MergeConflictItem {
 
 export interface WaveMergeResult {
 	ok: boolean;
+	/** Machine-readable refusal reason (stale branch, unexplained deletion, ...) */
+	error?: string;
 	publishedLayerId?: string;
+	/** Layer the branches were forked from / that the merge was applied on top of */
+	baseLayerId?: string;
+	/** Result of the strict host <-> published layer check on the applied delta */
+	hostMatchesLayer?: boolean;
+	hostMismatches?: string[];
+	/** Non-fatal drift on layer paths that this wave did not touch (reported only) */
+	hostDrift?: string[];
+	/** Id of the host pre-image snapshot usable by `rollbackPublishedLayer` */
+	rollbackSnapshotId?: string;
 	mergedFiles: Array<{
 		path: string;
 		changeType: "added" | "modified" | "deleted";
@@ -215,4 +268,5 @@ export interface StoreMetrics {
 	storedBytes: number;
 	savedBytes: number;
 	dedupRatio: number;
+	headLayerId?: string;
 }
