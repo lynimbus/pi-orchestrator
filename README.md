@@ -1,6 +1,85 @@
-# Pi Orchestrator (`~/.pi/agent/extensions/orchestrator`)
+# Pi Orchestrator
 
-独立的通用 Pi 插件，开启后强制执行 **「主代理拆解任务 → LayerFS 分支隔离并行派发子代理（强制配套单元测试） → 机械门禁校验 → 主代理仅审查 Diff 与测试 → LayerFS 三路合并与集成验证」** 工作流。
+独立的通用 Pi 插件（仓库：<https://github.com/lynimbus/pi-orchestrator>），以 **Pi git 包**的形式从 GitHub 安装与更新：克隆、缓存、版本解析全部由 Pi 管理，你不需要再手工把文件拷进 `~/.pi/agent/extensions/`。开启后强制执行 **「主代理拆解任务 → LayerFS 分支隔离并行派发子代理（强制配套单元测试） → 机械门禁校验 → 主代理仅审查 Diff 与测试 → LayerFS 三路合并与集成验证」** 工作流。
+
+## 安装
+
+主命令（HTTPS，推荐）：
+
+```bash
+pi install git:github.com/lynimbus/pi-orchestrator
+```
+
+SSH 备选（已在本机配置 GitHub SSH key 时可用）：
+
+```bash
+pi install git:git@github.com:lynimbus/pi-orchestrator
+```
+
+- 安装只会把一条 **包声明写进 `~/.pi/agent/settings.json` 的 `packages` 数组**（形如 `"git:github.com/lynimbus/pi-orchestrator"`）。随后的 **克隆、缓存与扩展加载都由 Pi 管理**，不再需要手工拷贝文件，也不需要在 extensions 目录里维护副本。
+- 需要固定版本时加 `@<ref>` 后缀，例如 `pi install git:github.com/lynimbus/pi-orchestrator@v0.1.0`；不带 `@` 则跟随仓库默认分支。
+- 安装完成后需 **重启 Pi**，或在当前会话执行 **`/reload`**，新扩展才会生效。
+- 想确认装上了什么，用 `pi list` 查看已安装的包及其来源。
+
+## 更新
+
+```bash
+pi update git:github.com/lynimbus/pi-orchestrator   # 只更新这一个 git 包
+pi update --extensions                              # 更新全部已安装的扩展包
+```
+
+- git 包以 **仓库 URL 为身份标识**（`git:github.com/lynimbus/pi-orchestrator`），`pi update` 按该标识重新拉取对应仓库。
+- 安装/更新时带了 `@<ref>`（例如 `@v0.1.0`、`@<commit>`）就是 **固定版本**：`pi update` **不会**把它移动到更新的 ref；想跟随分支就改回不带 `@` 的仓库 URL 重新安装。
+- 更新完成后需 **重启 Pi**，或执行 **`/reload`** 才会用上新代码（扩展是进程内加载的，旧版本不会自动替换）。
+- `pi list` 可随时查看已装包、来源与版本标识。
+
+## 从本地目录副本迁移（去掉本地拷贝）
+
+老版本是手工把代码拷进 `~/.pi/agent/extensions/orchestrator` 的（迁移前要先打包备份的 legacy 副本），这份副本已经过期、不再需要。
+
+**为什么迁移后只保留 git 包**：Pi 判断「这是不是同一个包」靠**包身份去重**，可用的身份标识是 **npm 包名 / git 仓库 URL / 本地绝对路径**这三类；`~/.pi/agent/extensions/orchestrator` 这个手工副本（迁移前要备份的那份）没有包声明，与 `git:github.com/lynimbus/pi-orchestrator` 属于**两条不同来源**，不会被 Pi 认成同一个包。因此两者共存时**可能触发同名扩展重复加载或加载歧义**——具体加载几次、`/orch` 命令最终解析到哪份代码，取决于 Pi 的加载顺序与去重实现，本文档对此**不做断言**（属于未在当前环境验证过的运行时行为）。可验证的稳妥结论是：迁移结束后**只保留 git 包**，旧副本打进 `.backup` 归档留档即可。
+
+1. **先装 git 包**：按上面的 `## 安装` 执行 `pi install git:github.com/lynimbus/pi-orchestrator`，并用 `pi list` 确认它已在列表里。
+
+2. **备份本地副本**（迁移前必须先备份，别直接删）：
+
+   ```bash
+   mkdir -p ~/.pi/agent/extensions/.backup && tar -czf ~/.pi/agent/extensions/.backup/orchestrator-$(date +%Y%m%d-%H%M%S).tgz -C ~/.pi/agent/extensions orchestrator
+   ```
+
+3. **移除本地拷贝**：
+
+   ```bash
+   rm -rf ~/.pi/agent/extensions/orchestrator
+   ```
+
+4. **校验**：
+   - `pi list` 输出中能看到 `git:github.com/lynimbus/pi-orchestrator`，且 extensions 目录下不再有同名目录；
+   - 重启 Pi（或执行 `/reload`）后，`/orch status` 能正常返回当前波次状态与 LayerFS 存储统计。
+
+5. **回滚**（想退回本地副本时）：把备份解回 extensions 目录，并卸掉 git 包，二者不要共存：
+
+   ```bash
+   tar -xzf ~/.pi/agent/extensions/.backup/orchestrator-<时间戳>.tgz -C ~/.pi/agent/extensions
+   pi remove git:github.com/lynimbus/pi-orchestrator
+   ```
+
+## 本地开发
+
+```bash
+git clone https://github.com/lynimbus/pi-orchestrator
+cd pi-orchestrator
+npm test        # node ./test.ts && node ./test-regressions.ts && node ./test-waves.ts && node ./test-packaging-manifest.ts && node ./test-packaging-docs.ts
+```
+
+本地调试有两种方式，都指向当前工作目录，不写死绝对路径：
+
+- **写进个人设置**：在仓库根目录执行 `pi install ./`（把 `./` 作为本地包写进个人设置），改完代码后重启 Pi 或 `/reload` 生效；开发完成后用 `pi remove ./` 摘掉这条本地声明。
+- **临时加载**：`pi -e ./index.ts` 直接加载入口文件跑一次，不写任何设置，适合快速验证。
+
+> 仓库内还带了一个形式化验证技能 **`.agents/skills/verify-wave-integration`**：修改 `integration-state.ts`、`index.ts` 的集成流程（`orch_integrate` / `orch_retry_integration` / `orch_rollback_integration` / `reconcileIntegrationState`）或 `layerfs-engine.ts` 的 `mergeAndPublishWave` 之前，请先跑它。它对「波次只从 base 层合并一次、崩溃对账不卡死、回滚保留任务状态」做穷尽式模型检查，能挡住重复合并抹掉文件这类事故。
+
+---
 
 ## 快速上手
 
@@ -81,7 +160,15 @@ pi --orch --orch-model group/deepseek --orch-thinking medium
 ## 测试
 
 ```bash
-npm test    # node ./test.ts && node ./test-regressions.ts
+npm test    # node ./test.ts && node ./test-regressions.ts && node ./test-waves.ts && node ./test-packaging-manifest.ts && node ./test-packaging-docs.ts
 ```
+
+`npm test` 现在是**五段链**，也可以按需单独跑某一段：
+
+- `node ./test.ts`：核心编排 / LayerFS 行为
+- `node ./test-regressions.ts`：回归用例
+- `node ./test-waves.ts`：多波次与派发用例
+- `node ./test-packaging-manifest.ts`：包清单契约（`package.json` 的 `pi.extensions`、入口文件、`npm test` 脚本段数等）
+- `node ./test-packaging-docs.ts`：纯文本契约测试，保证这份 README 的安装/更新/迁移叙事不会退回「手工拷贝目录」的老写法
 
 `test-regressions.ts` 覆盖：重复 integrate 被拒且宿主不变、跨分支新增文件不丢、宿主快照/校验/回滚/重合并、可执行位、非相关漂移、TMPDIR/诊断/超时、损坏 meta、source root 绑定、集成状态机。

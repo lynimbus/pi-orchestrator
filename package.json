@@ -1,12 +1,16 @@
 {
   "name": "pi-orchestrator",
   "version": "0.1.0",
-  "description": "Strict Lead-Subagent TDD & LayerFS-isolated multi-wave orchestrator extension for Pi",
+  "description": "Strict Lead-Subagent TDD & LayerFS-isolated multi-wave orchestrator Pi git package (install: pi install git:github.com/lynimbus/pi-orchestrator)",
   "type": "module",
   "license": "MIT",
   "main": "./index.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lynimbus/pi-orchestrator.git"
+  },
   "scripts": {
-    "test": "node ./test.ts && node ./test-regressions.ts && node ./test-waves.ts"
+    "test": "node ./test.ts && node ./test-regressions.ts && node ./test-waves.ts && node ./test-packaging-manifest.ts && node ./test-packaging-docs.ts"
   },
   "pi": {
     "extensions": [
@@ -15,7 +19,7 @@
   },
   "keywords": [
     "pi",
-    "extension",
+    "pi-package",
     "orchestrator",
     "subagent",
     "tdd",

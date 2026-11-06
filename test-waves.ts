@@ -514,7 +514,7 @@ function wiringTests(): void {
 		);
 	});
 
-	testCase("required: package.json test script runs test.ts, test-regressions.ts and test-waves.ts", () => {
+	testCase("required: package.json test script runs every registered suite", () => {
 		const pkg = JSON.parse(readRepoFile("package.json")) as { scripts?: Record<string, string> };
 		const script = pkg.scripts?.test ?? "";
 		const parts = script
@@ -525,6 +525,8 @@ function wiringTests(): void {
 			"node ./test.ts",
 			"node ./test-regressions.ts",
 			"node ./test-waves.ts",
+			"node ./test-packaging-manifest.ts",
+			"node ./test-packaging-docs.ts",
 		]);
 	});
 
