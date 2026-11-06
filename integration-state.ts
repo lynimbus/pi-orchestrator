@@ -74,7 +74,6 @@ export function reconcileIntegrationRecord(
 	if (!rec || rec.status !== "running") return false;
 
 	if (headLayerId === rec.parentLayerId) {
-		// Nothing was published: safe to attempt the merge again.
 		plan.integration = undefined;
 		plan.phase = "READY_TO_INTEGRATE";
 		return true;

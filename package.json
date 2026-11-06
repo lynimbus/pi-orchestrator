@@ -10,7 +10,7 @@
     "url": "git+https://github.com/lynimbus/pi-orchestrator.git"
   },
   "scripts": {
-    "test": "node ./test.ts && node ./test-regressions.ts && node ./test-waves.ts && node ./test-packaging-manifest.ts && node ./test-packaging-docs.ts"
+    "test": "node ./test.ts && node ./test-regressions.ts && node ./test-waves.ts && node ./test-packaging-manifest.ts && node ./test-packaging-docs.ts && node ./test-primitives.ts"
   },
   "pi": {
     "extensions": [

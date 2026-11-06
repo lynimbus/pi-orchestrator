@@ -5,8 +5,31 @@ import * as path from "node:path";
 import { LayerFSEngine } from "./layerfs-engine.ts";
 import type { TaskSpec } from "./types.ts";
 import { runMechanicalVerificationGate } from "./verifier.ts";
+import { SCRATCH_DIR_NAMES, scratchDirs } from "./workspace-env.ts";
 
 const STORE_ROOT = path.join(os.homedir(), ".pi", "agent", "orchestrator-layerfs");
+
+/**
+ * Single source of the `src/math.js` fixture used by this suite.
+ *
+ * The fixture is needed three times (the initial host import, the task-t3 edit that rewrites
+ * `add`, and the task-t4 edit that rewrites `sub`); the only difference between those copies is
+ * the body of the two functions, so the shared 7 lines live here and the callers pass only the
+ * return statements they need. `mathJs()` reproduces the original file byte-for-byte.
+ */
+function mathJs(addReturn = "return a + b;", subReturn = "return a - b;"): string {
+	return [
+		"function add(a, b) {",
+		`  ${addReturn}`,
+		"}",
+		"",
+		"function sub(a, b) {",
+		`  ${subReturn}`,
+		"}",
+		"",
+		"module.exports = { add, sub };",
+	].join("\n");
+}
 
 interface Sandbox {
 	hostDir: string;
@@ -35,7 +58,6 @@ async function createSandbox(tag: string, files: Record<string, string>): Promis
 	};
 }
 
-/** Imports the host as L1, forks one branch per edit and commits `relPath` with the given text. */
 async function buildLineMergeWave(
 	tag: string,
 	relPath: string,
@@ -60,9 +82,9 @@ async function buildLineMergeWave(
 async function testMultiBranchDisjointLineMergeIsOrderIndependent() {
 	const baseText = "A\nB\nC";
 	const edits = {
-		"task-t1": "B\nA\nB\nC", // insert "B" at 0..0
-		"task-t2": "A\nC", // delete "B" at 1..2
-		"task-t3": "A\nB\nX\nC", // insert "X" at 2..2
+		"task-t1": "B\nA\nB\nC",
+		"task-t2": "A\nC",
+		"task-t3": "A\nB\nX\nC",
 	};
 	const orders = [
 		["task-t1", "task-t2", "task-t3"],
@@ -121,9 +143,9 @@ async function testMultiBranchDisjointLineMergeIsOrderIndependent() {
 async function testMultiBranchDeleteModifyConflictIsOrderIndependent() {
 	const baseText = "A\nB\nC";
 	const edits = {
-		"task-t1": "B\nA\nB\nC", // insert "B" at 0..0
-		"task-t2": "A\nC", // delete "B" at 1..2
-		"task-t3": "A\nB2\nC", // modify "B" -> "B2" at 1..2
+		"task-t1": "B\nA\nB\nC",
+		"task-t2": "A\nC",
+		"task-t3": "A\nB2\nC",
 	};
 	const orders = [
 		["task-t1", "task-t2", "task-t3"],
@@ -170,7 +192,6 @@ async function testMultiBranchDeleteModifyConflictIsOrderIndependent() {
 async function testModeOnlyChangeIsMergedAndPublished() {
 	const content = "#!/bin/sh\necho hi\n";
 
-	// (a) single-branch mode-only change
 	{
 		const sandbox = await createSandbox("t2-mode-single", { "script.sh": content });
 		try {
@@ -181,7 +202,6 @@ async function testModeOnlyChangeIsMergedAndPublished() {
 			sandbox.engine.forkBranch("task-mode", "L1");
 			const ws = sandbox.engine.mountWorkspace("task-mode");
 			const workspaceFile = path.join(ws.workspacePath, "script.sh");
-			// chmod only: byte contents stay identical
 			fs.chmodSync(workspaceFile, 0o755);
 			assert.equal(fs.readFileSync(workspaceFile, "utf-8"), content);
 			sandbox.engine.commitWorkspace("task-mode", "chmod +x script.sh");
@@ -212,7 +232,6 @@ async function testModeOnlyChangeIsMergedAndPublished() {
 		}
 	}
 
-	// (b) multi-branch: one branch chmods, another edits the bytes -> mode must survive
 	const multiBranchOrders = [
 		["task-mode", "task-edit"],
 		["task-edit", "task-mode"],
@@ -231,11 +250,9 @@ async function testModeOnlyChangeIsMergedAndPublished() {
 			const wsMode = sandbox.engine.mountWorkspace("task-mode");
 			const wsEdit = sandbox.engine.mountWorkspace("task-edit");
 
-			// Mode-only touch on branch 1
 			fs.chmodSync(path.join(wsMode.workspacePath, "script.sh"), 0o755);
 			sandbox.engine.commitWorkspace("task-mode", "chmod +x script.sh");
 
-			// Content-only touch on branch 2 (keeps 0o644)
 			fs.writeFileSync(
 				path.join(wsEdit.workspacePath, "script.sh"),
 				"#!/bin/sh\necho bye\n",
@@ -269,7 +286,6 @@ async function testModeOnlyChangeIsMergedAndPublished() {
 		}
 	}
 
-	// (c) both branches only chmod -> convergent entry with mode 0o755
 	{
 		const sandbox = await createSandbox("t2-mode-both", { "script.sh": content });
 		try {
@@ -299,40 +315,211 @@ async function testModeOnlyChangeIsMergedAndPublished() {
 	}
 }
 
+/**
+ * Ablation oracle for the LAST hidden link: the `.tmp` / `.cache` scratch convention must
+ * have exactly ONE definition (`SCRATCH_DIR_NAMES` in workspace-env.ts). `layerfs-engine.ts`
+ * spreads that same tuple into `IGNORED_DIRS`, so renaming a scratch dir in one place moves
+ * both the scratch paths AND the import exclusion together.
+ *
+ * This is deliberately behavioural: it imports a real host tree and inspects the produced
+ * LayerFS layer tree, instead of trusting the source text.
+ */
+async function testScratchDirsAreTheSingleSourceOfTruth() {
+	// A host import must never capture scratch dirs.
+	const sandbox = await createSandbox("t3-scratch-ignore", {
+		".tmp/junk.txt": "ephemeral tmp output\n",
+		".cache/junk.txt": "ephemeral cache output\n",
+		"src/keep.txt": "keep me\n",
+	});
+	try {
+		const layer = sandbox.engine.importHostAsLayer("scratch ignore import");
+		const paths = Object.keys(sandbox.engine.getLayerTree(layer.layerId));
+
+		assert.equal(
+			paths.includes(".tmp/junk.txt"),
+			false,
+			`imported layer must exclude the tmp scratch file, got ${JSON.stringify(paths)}`,
+		);
+		assert.equal(
+			paths.includes(".cache/junk.txt"),
+			false,
+			`imported layer must exclude the cache scratch file, got ${JSON.stringify(paths)}`,
+		);
+		for (const scratchName of SCRATCH_DIR_NAMES) {
+			assert.equal(
+				paths.some((p) => p === scratchName || p.startsWith(`${scratchName}/`)),
+				false,
+				`imported layer must exclude every path under SCRATCH_DIR_NAMES entry ${scratchName}`,
+			);
+		}
+		assert.equal(
+			paths.includes("src/keep.txt"),
+			true,
+			`imported layer must keep ordinary files, got ${JSON.stringify(paths)}`,
+		);
+	} finally {
+		sandbox.cleanup();
+	}
+
+	// The scratch dirs ARE the tuple of path names.
+	assert.deepEqual(
+		[...SCRATCH_DIR_NAMES],
+		[".tmp", ".cache"],
+		"SCRATCH_DIR_NAMES must stay the documented .tmp/.cache pair",
+	);
+	const dirs = scratchDirs("root");
+	assert.equal(dirs.tmpDir, path.join("root", ".tmp"), "scratchDirs('root').tmpDir must be root/.tmp");
+	assert.equal(
+		dirs.cacheDir,
+		path.join("root", ".cache"),
+		"scratchDirs('root').cacheDir must be root/.cache",
+	);
+	assert.equal(
+		path.basename(dirs.tmpDir),
+		SCRATCH_DIR_NAMES[0],
+		"tmpDir basename must be SCRATCH_DIR_NAMES[0] -- one source of truth",
+	);
+	assert.equal(
+		path.basename(dirs.cacheDir),
+		SCRATCH_DIR_NAMES[1],
+		"cacheDir basename must be SCRATCH_DIR_NAMES[1] -- one source of truth",
+	);
+}
+
+/**
+ * Ablation oracle for the mismatch cap collapse: more than 50 corrupted host files must
+ * still stop at exactly 50 mismatches after at most one extra path was checked.
+ */
+async function testHostMismatchCapIsFifty() {
+	const files: Record<string, string> = {};
+	for (let i = 0; i < 60; i++) files[`tracked/file-${String(i).padStart(2, "0")}.txt`] = `original-${i}\n`;
+	const sandbox = await createSandbox("t3-mismatch-cap", files);
+	try {
+		sandbox.engine.importHostAsLayer("cap import");
+		for (let i = 0; i < 60; i++) {
+			fs.writeFileSync(
+				path.join(sandbox.hostDir, `tracked/file-${String(i).padStart(2, "0")}.txt`),
+				`corrupted-${i}-${"x".repeat(32)}\n`,
+				"utf-8",
+			);
+		}
+
+		const verification = sandbox.engine.verifyHostMatchesLayer();
+		assert.equal(verification.matches, false, "60 corrupted files must not match the layer");
+		assert.equal(
+			verification.mismatches.length,
+			50,
+			`mismatch list must be capped at 50, got ${verification.mismatches.length}`,
+		);
+		assert.ok(
+			verification.checked <= 51,
+			`verification must stop early (<=51 paths checked), checked ${verification.checked}`,
+		);
+		assert.equal(verification.layerId, "L1", "verification must report the verified layer id");
+	} finally {
+		sandbox.cleanup();
+	}
+}
+
+/** Single-file host drift: one deleted file and one modified file must both be reported. */
+async function testSingleFileHostDriftMessages() {
+	const sandbox = await createSandbox("t3-single-drift", {
+		"keep.txt": "keep\n",
+		"gone.txt": "gone\n",
+	});
+	try {
+		sandbox.engine.importHostAsLayer("drift import");
+
+		fs.rmSync(path.join(sandbox.hostDir, "gone.txt"));
+		const afterDelete = sandbox.engine.verifyHostMatchesLayer();
+		assert.equal(afterDelete.matches, false, "a deleted tracked file must not match the layer");
+		assert.equal(afterDelete.mismatches.length, 1, "exactly one drift entry expected");
+		assert.ok(
+			afterDelete.mismatches[0].startsWith("gone.txt: "),
+			`mismatch must name the deleted path, got: ${afterDelete.mismatches[0]}`,
+		);
+		assert.match(
+			afterDelete.mismatches[0],
+			/missing or unreadable/,
+			`deleted file mismatch must say 'missing or unreadable', got: ${afterDelete.mismatches[0]}`,
+		);
+
+		fs.writeFileSync(path.join(sandbox.hostDir, "keep.txt"), "keep-modified\n", "utf-8");
+		const afterModify = sandbox.engine.verifyHostMatchesLayer();
+		assert.equal(afterModify.matches, false, "a modified tracked file must not match the layer");
+		assert.ok(
+			afterModify.mismatches.some((message) => message === "keep.txt: content mismatch"),
+			`modified file must report 'keep.txt: content mismatch', got: ${JSON.stringify(afterModify.mismatches)}`,
+		);
+	} finally {
+		sandbox.cleanup();
+	}
+}
+
+/**
+ * Ablation oracle for deleting `threeWayMergeText`: three branches editing three DIFFERENT
+ * lines of one base file must still merge into a host file containing all three edits.
+ */
+async function testThreeBranchDisjointLineMergePublishesAllEdits() {
+	const baseText = "line-1\nline-2\nline-3\nline-4\nline-5\n";
+	const sandbox = await buildLineMergeWave("t3-three-way-ablation", "shared.txt", baseText, {
+		"task-a": "LINE-1\nline-2\nline-3\nline-4\nline-5\n",
+		"task-b": "line-1\nline-2\nLINE-3\nline-4\nline-5\n",
+		"task-c": "line-1\nline-2\nline-3\nline-4\nLINE-5\n",
+	});
+	try {
+		const result = sandbox.engine.mergeAndPublishWave(["task-a", "task-b", "task-c"], {
+			allowAutoThreeWayLineMerge: true,
+			message: "three-way ablation merge",
+		});
+		assert.equal(
+			result.ok,
+			true,
+			`3-branch disjoint line merge must succeed, conflicts: ${JSON.stringify(result.conflicts)}`,
+		);
+		assert.deepEqual(result.conflicts, [], "disjoint 3-branch merge must not report conflicts");
+
+		const mergedOnHost = fs.readFileSync(path.join(sandbox.hostDir, "shared.txt"), "utf-8");
+		assert.equal(
+			mergedOnHost,
+			"LINE-1\nline-2\nLINE-3\nline-4\nLINE-5\n",
+			`merged host file must contain all three branch edits, got: ${JSON.stringify(mergedOnHost)}`,
+		);
+
+		const published = sandbox.engine.loadLayer(result.publishedLayerId!);
+		const entry = published.tree["shared.txt"];
+		assert.ok(entry, "published layer must contain shared.txt");
+		assert.equal(
+			sandbox.engine.readCanonicalBlob(entry.objectId).toString("utf-8"),
+			mergedOnHost,
+			"published blob must match the merged host text",
+		);
+	} finally {
+		sandbox.cleanup();
+	}
+}
+
 async function runTests() {
 	const tmpHost = await fs.promises.mkdtemp(path.join(os.tmpdir(), "orch-test-host-"));
 	const testProjectId = `test-proj-${Date.now()}`;
 
 	try {
-		// Create initial files in host
 		fs.mkdirSync(path.join(tmpHost, "src"), { recursive: true });
 		fs.mkdirSync(path.join(tmpHost, "tests"), { recursive: true });
 		fs.writeFileSync(
 			path.join(tmpHost, "src", "math.js"),
-			[
-				"function add(a, b) {",
-				"  return a + b;",
-				"}",
-				"",
-				"function sub(a, b) {",
-				"  return a - b;",
-				"}",
-				"",
-				"module.exports = { add, sub };",
-			].join("\n"),
+			mathJs(),
 			"utf-8",
 		);
 		fs.writeFileSync(path.join(tmpHost, ".env"), "SECRET_KEY=do_not_import\n", "utf-8");
 
 		const engine = new LayerFSEngine(tmpHost, testProjectId);
 
-		// 1. Test initial Layer import & secret filtering
 		const l1 = engine.importHostAsLayer("Initial import");
 		assert.equal(l1.layerId, "L1");
 		assert.ok(l1.tree["src/math.js"], "src/math.js should be in Layer L1");
 		assert.equal(l1.tree[".env"], undefined, ".env secret file must be excluded from LayerFS store");
 
-		// 2. Fork two parallel branches from L1
 		const b1 = engine.forkBranch("task-t1", "L1");
 		const b2 = engine.forkBranch("task-t2", "L1");
 		assert.equal(b1.baseLayerId, "L1");
@@ -341,12 +528,10 @@ async function runTests() {
 		const ws1 = engine.mountWorkspace("task-t1");
 		const ws2 = engine.mountWorkspace("task-t2");
 
-		// Scratch .tmp and .cache must exist
 		assert.ok(fs.existsSync(ws1.tmpDir));
 		assert.ok(fs.existsSync(ws1.cacheDir));
 		fs.writeFileSync(path.join(ws1.tmpDir, "scratch.txt"), "ephemeral", "utf-8");
 
-		// Task T1 adds multiply.js + tests/multiply.test.js
 		fs.writeFileSync(
 			path.join(ws1.workspacePath, "src", "multiply.js"),
 			"exports.multiply = (a, b) => a * b;\n",
@@ -367,19 +552,16 @@ async function runTests() {
 		const c1 = engine.commitWorkspace("task-t1", "Implement multiply", ws1.headCommitId);
 		assert.equal(c1.tree[".tmp/scratch.txt"], undefined, ".tmp scratch files must never be committed");
 
-		// CAS check: committing again with stale expectedHeadCommitId must throw
 		assert.throws(
 			() => engine.commitWorkspace("task-t1", "Stale commit", ws1.headCommitId),
 			/CAS Conflict/,
 		);
 
-		// Diff check: implementation diff and test diff must be separated
 		const diff1 = engine.diffBranch("task-t1", ["tests/multiply.test.js"]);
 		assert.equal(diff1.files.length, 2);
 		assert.match(diff1.implUnifiedDiff, /src\/multiply\.js/);
 		assert.match(diff1.testUnifiedDiff, /tests\/multiply\.test\.js/);
 
-		// 3. Test Mechanical Verification Gate (Passing case)
 		const spec1: TaskSpec = {
 			id: "T1",
 			title: "Implement multiply",
@@ -402,7 +584,6 @@ async function runTests() {
 		assert.equal(gate1.gateReport.passed, true, "Mechanical gate should pass for valid T1");
 		assert.equal(gate1.workerReport.status, "DONE");
 
-		// 4. Test Mechanical Gate Failures (Tampering with .only and out-of-scope file)
 		fs.writeFileSync(
 			path.join(ws2.workspacePath, "src", "unauthorized.js"),
 			"exports.bad = true;\n",
@@ -440,7 +621,6 @@ async function runTests() {
 		assert.equal(gate2Bad.gateReport.checks.fileScope.passed, false, "Should catch unauthorized.js");
 		assert.equal(gate2Bad.gateReport.checks.testIntegrity.passed, false, "Should catch .only()");
 
-		// Fix T2 in its workspace and re-commit
 		fs.rmSync(path.join(ws2.workspacePath, "src", "unauthorized.js"));
 		fs.writeFileSync(
 			path.join(ws2.workspacePath, "src", "divide.js"),
@@ -462,7 +642,6 @@ async function runTests() {
 		);
 		assert.equal(gate2Good.gateReport.passed, true, "Fixed T2 should pass gate");
 
-		// 5. Merge Wave 1 (T1 + T2) and publish Layer L2 to host
 		const mergeRes = engine.mergeAndPublishWave(["task-t1", "task-t2"], {
 			allowAutoThreeWayLineMerge: true,
 			message: "Wave 1 complete",
@@ -472,44 +651,21 @@ async function runTests() {
 		assert.ok(fs.existsSync(path.join(tmpHost, "src", "multiply.js")));
 		assert.ok(fs.existsSync(path.join(tmpHost, "src", "divide.js")));
 
-		// 6. Test 3-Way Line Merge on the same file (disjoint hunks in src/math.js)
 		engine.forkBranch("task-t3", "L2");
 		engine.forkBranch("task-t4", "L2");
 		const ws3 = engine.mountWorkspace("task-t3");
 		const ws4 = engine.mountWorkspace("task-t4");
 
-		// T3 modifies top of src/math.js
 		fs.writeFileSync(
 			path.join(ws3.workspacePath, "src", "math.js"),
-			[
-				"function add(a, b) {",
-				"  return Number(a) + Number(b);",
-				"}",
-				"",
-				"function sub(a, b) {",
-				"  return a - b;",
-				"}",
-				"",
-				"module.exports = { add, sub };",
-			].join("\n"),
+			mathJs("return Number(a) + Number(b);"),
 			"utf-8",
 		);
 		engine.commitWorkspace("task-t3", "Update add");
 
-		// T4 modifies bottom of src/math.js
 		fs.writeFileSync(
 			path.join(ws4.workspacePath, "src", "math.js"),
-			[
-				"function add(a, b) {",
-				"  return a + b;",
-				"}",
-				"",
-				"function sub(a, b) {",
-				"  return Number(a) - Number(b);",
-				"}",
-				"",
-				"module.exports = { add, sub };",
-			].join("\n"),
+			mathJs("return a + b;", "return Number(a) - Number(b);"),
 			"utf-8",
 		);
 		engine.commitWorkspace("task-t4", "Update sub");
@@ -523,10 +679,14 @@ async function runTests() {
 		assert.match(mergedMath, /Number\(a\) \+ Number\(b\)/);
 		assert.match(mergedMath, /Number\(a\) - Number\(b\)/);
 
-		// T2 regressions: N-way line merge order independence, conflict soundness, mode-only touches.
 		await testMultiBranchDisjointLineMergeIsOrderIndependent();
 		await testMultiBranchDeleteModifyConflictIsOrderIndependent();
 		await testModeOnlyChangeIsMergedAndPublished();
+
+		await testScratchDirsAreTheSingleSourceOfTruth();
+		await testHostMismatchCapIsFifty();
+		await testSingleFileHostDriftMessages();
+		await testThreeBranchDisjointLineMergePublishesAllEdits();
 
 		console.log("ALL LAYERFS ENGINE & MECHANICAL GATE TESTS PASSED!");
 	} finally {

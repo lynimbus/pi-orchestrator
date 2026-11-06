@@ -12,35 +12,18 @@
 
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import { isTestFilePath, matchesAnyPattern } from "./layerfs-engine.ts";
+import { hasGlobWildcard, isTestFilePath, matchesAnyPattern, normalizeRelPath } from "./path-patterns.ts";
+import { superviseChildProcess } from "./process-runner.ts";
 import type {
 	BranchDiffResult,
 	MechanicalGateReport,
 	TaskSpec,
 	WorkerStructuredReport,
 } from "./types.ts";
+import { ensureScratchDirs, scratchEnvironment } from "./workspace-env.ts";
 
-// ---------------------------------------------------------------------------
 // Dependency waves & allowedFiles overlap detection
-// ---------------------------------------------------------------------------
-
-/**
- * Normalizes a LayerFS relative path or glob: forward slashes, no leading `./`,
- * no duplicated separators and no trailing slash.
- */
-function normalizeRelPath(relPath: string): string {
-	let out = relPath.replace(/\\/g, "/");
-	while (out.startsWith("./")) out = out.slice(2);
-	out = out.replace(/\/{2,}/g, "/");
-	out = out.replace(/\/+$/, "");
-	return out;
-}
-
-function hasGlobWildcard(pattern: string): boolean {
-	return pattern.includes("*") || pattern.includes("?");
-}
 
 /**
  * Character-level glob intersection: is there any single path *segment* matched
@@ -149,7 +132,6 @@ export function patternsOverlap(patternA: string, patternB: string): boolean {
 	return false;
 }
 
-/** Returns true when any pair of `allowedFiles` patterns can address the same file. */
 export function allowedFilesOverlap(patternsA: string[], patternsB: string[]): boolean {
 	for (const patternA of patternsA) {
 		for (const patternB of patternsB) {
@@ -212,7 +194,6 @@ export function computeDependencyWaves(tasks: TaskSpec[]): { waves: string[][]; 
 			};
 		}
 
-		// Greedy first-fit packing of non-overlapping ready tasks into sequential sub-waves.
 		const subWaves: string[][] = [];
 		for (const id of ready) {
 			const candidate = taskMap.get(id)!;
@@ -262,7 +243,6 @@ export async function runMechanicalVerificationGate(
 ): Promise<{ gateReport: MechanicalGateReport; workerReport: WorkerStructuredReport }> {
 	const workerReport = parseWorkerStructuredReport(workerRawOutput);
 
-	// 1. File Scope Gate
 	const combinedAllowed = [...spec.allowedFiles, ...spec.testFiles];
 	const forbidden = spec.doNotTouch ?? [];
 	const outOfScopeFiles: string[] = [];
@@ -296,7 +276,6 @@ export async function runMechanicalVerificationGate(
 				? `All ${diff.files.length} changed file(s) are within allowed scope.`
 				: `Out-of-scope file modifications detected: ${outOfScopeFiles.join(", ")}`;
 
-	// 2. Unit Test Presence Gate
 	const addedTestLines = diff.files
 		.filter((f) => touchedTestFiles.includes(f.path))
 		.flatMap((f) =>
@@ -318,7 +297,6 @@ export async function runMechanicalVerificationGate(
 				? `Test file(s) touched (${touchedTestFiles.join(", ")}) but no new test cases or assertions were found in added lines.`
 				: `Updated ${touchedTestFiles.length} test file(s) (${touchedTestFiles.join(", ")}) with +${addedTestLines.length} added test lines.`;
 
-	// 3. Test Integrity / Anti-Tampering Gate
 	const tamperingWarnings: string[] = [];
 	for (const line of addedTestLines) {
 		for (const pattern of TEST_SKIP_OR_ONLY_PATTERNS) {
@@ -328,7 +306,6 @@ export async function runMechanicalVerificationGate(
 		}
 	}
 
-	// Check if existing assertions were deleted without replacement
 	for (const f of diff.files) {
 		if (!touchedTestFiles.includes(f.path)) continue;
 		if (f.changeType === "deleted") {
@@ -341,7 +318,6 @@ export async function runMechanicalVerificationGate(
 		? "No test tampering (.only, .skip, or deleted test files) detected."
 		: `Test integrity violations: ${tamperingWarnings.join("; ")}`;
 
-	// 4. Independent Test Command Execution inside Workspace
 	const testCmdResult = await executeWorkspaceCommand(
 		spec.testCommand,
 		workspacePath,
@@ -356,7 +332,6 @@ export async function runMechanicalVerificationGate(
 		? `Command "${spec.testCommand}" exited 0 in ${testCmdResult.durationMs}ms.`
 		: `Command "${spec.testCommand}" failed with exit code ${testCmdResult.exitCode} (${testCmdResult.durationMs}ms).`;
 
-	// 5. Worker Status Gate
 	const workerStatusPassed =
 		workerReport.status === "DONE" || workerReport.status === "UNKNOWN";
 	const workerStatusDetails =
@@ -435,21 +410,7 @@ const FAILURE_LINE_REGEX =
 const FALSE_POSITIVE_LINE_REGEX =
 	/(\b0\s+(failed|failures?|errors?)\b|all\s+.{0,24}\s+passed|no failures|passed\s*$)/i;
 
-/**
- * The scratch directory handed to TMPDIR/XDG_CACHE_HOME MUST exist and be writable.
- * LayerFS workspaces create it, but the host workspace used by integration tests does
- * not -- which used to make plain `mktemp` fail with a bogus ENOENT.
- */
-function ensureScratchDir(preferred: string, label: string): string {
-	try {
-		fs.mkdirSync(preferred, { recursive: true });
-		fs.accessSync(preferred, fs.constants.W_OK);
-		return preferred;
-	} catch {
-		return fs.mkdtempSync(path.join(os.tmpdir(), `orch-${label}-`));
-	}
-}
-
+/** Snapshot of the workspace-root file names, used to detect (and clean) stray artifacts. */
 function rootFileSnapshot(dir: string): Set<string> {
 	const names = new Set<string>();
 	try {
@@ -505,12 +466,11 @@ export async function executeWorkspaceCommand(
 	// Integration tests run against the HOST workspace: keep scratch dirs outside
 	// the repo so TMPDIR works without polluting the host working tree.
 	const scratchRoot = options.scratchRoot ?? workspacePath;
-	const tmpDir = ensureScratchDir(path.join(scratchRoot, ".tmp"), "tmp");
-	const cacheDir = ensureScratchDir(path.join(scratchRoot, ".cache"), "cache");
+	const dirs = ensureScratchDirs(scratchRoot);
 	const environment = [
 		`cwd=${workspacePath}`,
-		`TMPDIR=${tmpDir}`,
-		`XDG_CACHE_HOME=${cacheDir}`,
+		`TMPDIR=${dirs.tmpDir}`,
+		`XDG_CACHE_HOME=${dirs.cacheDir}`,
 		"CI=1",
 	].join(" | ");
 	const rootFilesBefore = options.cleanupStrayRootFiles
@@ -523,10 +483,7 @@ export async function executeWorkspaceCommand(
 			stdio: ["ignore", "pipe", "pipe"],
 			env: {
 				...process.env,
-				TMPDIR: tmpDir,
-				TMP: tmpDir,
-				TEMP: tmpDir,
-				XDG_CACHE_HOME: cacheDir,
+				...scratchEnvironment(dirs),
 				CI: "1",
 			},
 		});
@@ -563,89 +520,51 @@ export async function executeWorkspaceCommand(
 		proc.stdout.on("data", appendChunk);
 		proc.stderr.on("data", appendChunk);
 
-		let settled = false;
-		// Declared before `finish` so an already-aborted signal cannot hit a TDZ error.
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		let killTimer: ReturnType<typeof setTimeout> | undefined;
-		let forcedExitCode: number | undefined;
-		let onAbort: (() => void) | undefined;
-
-		const finish = (exitCode: number) => {
-			if (settled) return;
-			settled = true;
-			if (timer) clearTimeout(timer);
-			if (killTimer) clearTimeout(killTimer);
-			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
-			if (pendingLine.trim() && failureLines.length < 200) {
-				const trimmed = pendingLine.trim();
-				if (FAILURE_LINE_REGEX.test(trimmed) && !FALSE_POSITIVE_LINE_REGEX.test(trimmed)) {
-					failureLines.push(trimmed.slice(0, 400));
-				}
-			}
-
-			const strayArtifacts: string[] = [];
-			if (options.cleanupStrayRootFiles) {
-				for (const name of rootFileSnapshot(workspacePath)) {
-					if (rootFilesBefore.has(name) || name.startsWith(".")) continue;
-					const full = path.join(workspacePath, name);
-					try {
-						if (!fs.lstatSync(full).isFile()) continue;
-						fs.rmSync(full, { force: true });
-						strayArtifacts.push(name);
-					} catch {
-						// never let cleanup break test reporting
+		// Terminate first, resolve on "close" -- never leave an orphan process behind.
+		// Timeout (124) / abort (130) / spawn error (127) policy lives in process-runner.ts.
+		superviseChildProcess(proc, {
+			timeoutMs,
+			signal,
+			onTerminate: (label) => appendText(`\n[${label}]`),
+			onProcessError: (err) => {
+				appendText(`\n[Process error: ${err.message}]`);
+				return 127;
+			},
+			onFinish: (exitCode: number) => {
+				if (pendingLine.trim() && failureLines.length < 200) {
+					const trimmed = pendingLine.trim();
+					if (FAILURE_LINE_REGEX.test(trimmed) && !FALSE_POSITIVE_LINE_REGEX.test(trimmed)) {
+						failureLines.push(trimmed.slice(0, 400));
 					}
 				}
-			}
 
-			const lines = combined.trim().split("\n");
-			resolve({
-				command,
-				exitCode,
-				durationMs: Date.now() - start,
-				outputTail: lines.slice(-40).join("\n") || "(no output)",
-				outputHead: head.split("\n").slice(0, 40).join("\n") || "(no output)",
-				failureLines,
-				environment,
-				strayArtifacts,
-			});
-		};
-
-		// Terminate first, resolve on "close" -- never leave an orphan process behind.
-		const terminate = (code: number, label: string) => {
-			if (settled || forcedExitCode !== undefined) return;
-			forcedExitCode = code;
-			appendText(`\n[${label}]`);
-			try {
-				proc.kill("SIGTERM");
-			} catch {
-				finish(code);
-				return;
-			}
-			killTimer = setTimeout(() => {
-				try {
-					proc.kill("SIGKILL");
-				} catch {
-					finish(code);
+				const strayArtifacts: string[] = [];
+				if (options.cleanupStrayRootFiles) {
+					for (const name of rootFileSnapshot(workspacePath)) {
+						if (rootFilesBefore.has(name) || name.startsWith(".")) continue;
+						const full = path.join(workspacePath, name);
+						try {
+							if (!fs.lstatSync(full).isFile()) continue;
+							fs.rmSync(full, { force: true });
+							strayArtifacts.push(name);
+						} catch {
+							// never let cleanup break test reporting
+						}
+					}
 				}
-			}, 2000);
-		};
 
-		timer = setTimeout(() => terminate(124, `Timeout after ${timeoutMs}ms: SIGTERM`), timeoutMs);
-
-		if (signal) {
-			onAbort = () => terminate(130, "Aborted by signal: SIGTERM");
-			if (signal.aborted) {
-				onAbort();
-			} else {
-				signal.addEventListener("abort", onAbort, { once: true });
-			}
-		}
-
-		proc.on("close", (code) => finish(forcedExitCode ?? code ?? 1));
-		proc.on("error", (err) => {
-			appendText(`\n[Process error: ${err.message}]`);
-			finish(127);
+				const lines = combined.trim().split("\n");
+				resolve({
+					command,
+					exitCode,
+					durationMs: Date.now() - start,
+					outputTail: lines.slice(-40).join("\n") || "(no output)",
+					outputHead: head.split("\n").slice(0, 40).join("\n") || "(no output)",
+					failureLines,
+					environment,
+					strayArtifacts,
+				});
+			},
 		});
 	});
 }

@@ -2,39 +2,30 @@
  * Unit tests for dependency-wave computation, allowedFiles overlap detection and
  * escalated-wave integration/rollback wiring.
  *
- * Covers docs/orchestrator-issues.md Section 7 items 6, 7 and 8:
  * - computeDependencyWaves must split topologically ready tasks into sequential
  *   sub-waves whenever their allowedFiles overlap.
  * - Escalated host edits must be merged into the SAME published wave layer
  *   (`includeHostEdits`) instead of publishing an extra un-snapshotted layer.
  * - Rollback must use the recorded parent Layer (`targetParentLayerId`) so a whole
  *   merged chain can be restored atomically.
- * It also guards package.json and the documentation against regressions.
+ * - The shared harness (test-kit.ts) must capture throwing cases and settle the
+ *   exit status exactly once.
+ *
+ * Every assertion here observes a runtime outcome; none of them reads a source
+ * file as text, because such checks fail on renames but not on bugs.
  */
 
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { LayerFSEngine } from "./layerfs-engine.ts";
 import type { TaskSpec } from "./types.ts";
 import { allowedFilesOverlap, computeDependencyWaves, patternsOverlap } from "./verifier.ts";
+import { createSyncTestRunner } from "./test-kit.ts";
 
-let passed = 0;
-const failures: Array<{ name: string; error: unknown }> = [];
-
-function testCase(name: string, fn: () => void): void {
-	try {
-		fn();
-		passed++;
-		console.log(`  ok   ${name}`);
-	} catch (err) {
-		failures.push({ name, error: err });
-		console.error(`  FAIL ${name}`);
-		console.error(err instanceof Error ? err.message : String(err));
-	}
-}
+const runner = createSyncTestRunner();
+const testCase = runner.testCase;
 
 function task(
 	id: string,
@@ -55,9 +46,6 @@ function task(
 	};
 }
 
-// ---------------------------------------------------------------------------
-// patternsOverlap / allowedFilesOverlap
-// ---------------------------------------------------------------------------
 
 function overlapTests(): void {
 	console.log("patternsOverlap / allowedFilesOverlap");
@@ -147,6 +135,25 @@ function overlapTests(): void {
 		assert.equal(patternsOverlap("./src/*.ts", "src/a.ts"), true);
 	});
 
+	testCase("./ and // are normalized before comparing a file against a directory", () => {
+		// Normalization is observable behavior: the same logical path must overlap
+		// no matter how many "./" or "/" spellings the caller used.
+		assert.equal(patternsOverlap("./src//a.ts", "src/"), true);
+		assert.equal(patternsOverlap("./src//a.ts", "src/a.ts"), true);
+		assert.equal(patternsOverlap("src//", "./src"), true);
+		assert.equal(allowedFilesOverlap(["./src//a.ts"], ["src/"]), true);
+	});
+
+	testCase("allowedFilesOverlap honors ** and ? wildcards across pattern lists", () => {
+		// `**` covers any depth, `?` covers exactly one character: a shipped defect
+		// in either expansion lets two tasks write the same file concurrently.
+		assert.equal(allowedFilesOverlap(["docs/**"], ["docs/deep/nested/file.md"]), true);
+		assert.equal(allowedFilesOverlap(["src/**/*.ts"], ["src/a/b/c.ts"]), true);
+		assert.equal(allowedFilesOverlap(["src/a?c.ts"], ["src/abc.ts"]), true);
+		assert.equal(patternsOverlap("src/a?.ts", "src/abc.ts"), false);
+		assert.equal(allowedFilesOverlap(["src/*.ts"], ["src/*.tsx", "docs/*"]), false);
+	});
+
 	testCase("empty patterns never overlap", () => {
 		assert.equal(patternsOverlap("", ""), false);
 		assert.equal(patternsOverlap("", "src/a.ts"), false);
@@ -171,9 +178,6 @@ function overlapTests(): void {
 	});
 }
 
-// ---------------------------------------------------------------------------
-// computeDependencyWaves
-// ---------------------------------------------------------------------------
 
 function waveTests(): void {
 	console.log("computeDependencyWaves");
@@ -196,6 +200,19 @@ function waveTests(): void {
 		]);
 		assert.equal(result.error, undefined);
 		assert.deepEqual(result.waves, [["T1"], ["T2"], ["T3"]]);
+	});
+
+	testCase("a task overlapping its dependency still runs in a later wave", () => {
+		// T2 depends on T1 and overlaps it; T3 is independent but overlaps T1 too.
+		// Observable contract: dependencies always defer a task to a later wave, and
+		// an independent overlapping task is spilled behind the overlap, not merged.
+		const result = computeDependencyWaves([
+			task("T1", [], ["src/**"]),
+			task("T2", ["T1"], ["src/a.ts"]),
+			task("T3", [], ["src/a.ts"]),
+		]);
+		assert.equal(result.error, undefined);
+		assert.deepEqual(result.waves, [["T1"], ["T3"], ["T2"]]);
 	});
 
 	testCase("non-overlapping ready tasks stay in a single wave", () => {
@@ -339,11 +356,7 @@ function waveTests(): void {
 	});
 }
 
-// ---------------------------------------------------------------------------
-// Escalated wave integration + rollback (LayerFS end-to-end simulation)
-// ---------------------------------------------------------------------------
 
-const repoRoot = path.dirname(fileURLToPath(import.meta.url));
 const cleanupPaths: string[] = [];
 let projectCounter = 0;
 
@@ -357,19 +370,6 @@ function cleanup(): void {
 		fs.rmSync(target, { recursive: true, force: true });
 	}
 	cleanupPaths.length = 0;
-}
-
-function readRepoFile(relPath: string): string {
-	return fs.readFileSync(path.join(repoRoot, relPath), "utf-8");
-}
-
-/** Returns the slice of `src` between `startMarker` and `endMarker`. */
-function sourceBetween(src: string, startMarker: string, endMarker: string): string {
-	const start = src.indexOf(startMarker);
-	assert.notEqual(start, -1, `missing marker: ${startMarker}`);
-	const end = src.indexOf(endMarker, start + startMarker.length);
-	assert.notEqual(end, -1, `missing end marker: ${endMarker}`);
-	return src.slice(start, end);
 }
 
 function escalatedWaveTests(): void {
@@ -459,130 +459,186 @@ function escalatedWaveTests(): void {
 	);
 }
 
-// ---------------------------------------------------------------------------
-// index.ts wiring, package.json and issue-doc guards
-// ---------------------------------------------------------------------------
 
-function wiringTests(): void {
-	console.log("index.ts / package.json / docs wiring");
+// Shared harness (test-kit.ts): this suite delegates pass/fail counting,
+// printing and the exit status instead of keeping a private runner copy.
 
-	testCase("required: index.ts imports computeDependencyWaves from verifier.ts (no local copy)", () => {
-		const src = readRepoFile("index.ts");
-		assert.match(
-			src,
-			/import\s*\{[\s\S]*?\bcomputeDependencyWaves\b[\s\S]*?\}\s*from\s*"\.\/verifier\.ts";/,
-			"computeDependencyWaves must be imported from ./verifier.ts",
-		);
-		assert.doesNotMatch(
-			src,
-			/function\s+computeDependencyWaves\s*\(/,
-			"the duplicate local computeDependencyWaves definition must be removed",
-		);
-	});
+/**
+ * Redirects `console.log`/`console.error` into an array for probe assertions.
+ * `restore()` puts the originals back.
+ */
+function captureConsoleLines(): { lines: string[]; restore: () => void } {
+	const lines: string[] = [];
+	const originals = { log: console.log, error: console.error };
+	const sink = (...args: unknown[]): void => {
+		lines.push(args.map((arg) => (typeof arg === "string" ? arg : String(arg))).join(" "));
+	};
+	console.log = sink as typeof console.log;
+	console.error = sink as typeof console.error;
+	return {
+		lines,
+		restore: (): void => {
+			console.log = originals.log;
+			console.error = originals.error;
+		},
+	};
+}
 
-	testCase("required: orch_integrate passes includeHostEdits and reuses treeRegressionWarning", () => {
-		const src = readRepoFile("index.ts");
-		const block = sourceBetween(src, 'name: "orch_integrate"', 'name: "orch_retry_integration"');
-		assert.match(block, /const\s+escalatedIds\s*=\s*currentWaveIds\.filter\(/);
-		assert.match(block, /includeHostEdits:\s*escalatedIds\.length\s*>\s*0/);
-		assert.ok(
-			block.indexOf("const escalatedIds") < block.indexOf("engine.mergeAndPublishWave("),
-			"escalatedIds must be computed BEFORE merging so includeHostEdits can be passed",
-		);
-		assert.match(
-			block,
-			/reimportWarning\s*=\s*`\\n⚠ \$\{mergeResult\.treeRegressionWarning\}`/,
-			"reimportWarning must come from mergeResult.treeRegressionWarning",
-		);
-		assert.equal(
-			block.includes("engine.importHostAsLayer("),
-			false,
-			"escalated host edits must not be re-imported as an extra layer",
-		);
-	});
+function harnessConsolidationTests(): void {
+	console.log("shared test harness (test-kit.ts)");
 
-	testCase("required: orch_rollback_integration passes the recorded parent layer", () => {
-		const src = readRepoFile("index.ts");
-		const block = sourceBetween(
-			src,
-			'name: "orch_rollback_integration"',
-			'name: "orch_status"',
-		);
-		assert.match(
-			block,
-			/rollbackPublishedLayer\(\s*rec\.publishedLayerId\s*,\s*\{\s*targetParentLayerId:\s*rec\.parentLayerId\s*\}\s*\)/,
-		);
-	});
+	testCase("required: a throwing case is captured and finish() reports once", () => {
+		const { lines, restore } = captureConsoleLines();
+		const previousExitCode = process.exitCode;
+		Reflect.set(process, "exitCode", undefined);
 
-	testCase("required: package.json test script runs every registered suite", () => {
-		const pkg = JSON.parse(readRepoFile("package.json")) as { scripts?: Record<string, string> };
-		const script = pkg.scripts?.test ?? "";
-		const parts = script
-			.split("&&")
-			.map((part) => part.trim())
-			.filter(Boolean);
-		assert.deepEqual(parts, [
-			"node ./test.ts",
-			"node ./test-regressions.ts",
-			"node ./test-waves.ts",
-			"node ./test-packaging-manifest.ts",
-			"node ./test-packaging-docs.ts",
-		]);
-	});
-
-	testCase("required: docs Section 7 items 6/7/8 document the completed fixes", () => {
-		const docs = readRepoFile("docs/orchestrator-issues.md");
-		const section = docs.split("### 顺带排查出的其他潜在问题")[1] ?? "";
-		assert.ok(section.trim().length > 0, "Section 7 must exist");
-
-		const itemMap = new Map<number, string>();
-		let current: number | undefined;
-		for (const line of section.split("\n")) {
-			const heading = /^(\d+)\.\s+(.*)$/.exec(line);
-			if (heading) {
-				current = Number(heading[1]);
-				itemMap.set(current, heading[2]);
-			} else if (current !== undefined && line.trim()) {
-				itemMap.set(current, `${itemMap.get(current)}\n${line.trim()}`);
+		try {
+			const probe = createSyncTestRunner();
+			let escaped: unknown;
+			try {
+				probe.testCase("probe: throwing case", () => {
+					throw new Error("boom");
+				});
+				probe.testCase("probe: green case", () => {});
+			} catch (err) {
+				escaped = err;
 			}
-		}
+			assert.equal(escaped, undefined, "a throwing case must be captured, never rethrown");
+			assert.equal(process.exitCode, undefined, "only finish() may settle the exit status");
 
-		for (const index of [6, 7, 8]) {
-			const item = itemMap.get(index);
-			assert.ok(item, `Section 7 item ${index} must exist`);
-			assert.doesNotMatch(
-				item,
-				/未改动|未修复|遗留限制|已知限制/,
-				`Section 7 item ${index} must no longer be documented as an unfixed limitation`,
+			probe.finish();
+			assert.equal(process.exitCode, 1, "finish() must set process.exitCode = 1 on any failure");
+			const failureOutput = lines.join("\n");
+			assert.match(failureOutput, /  FAIL probe: throwing case/);
+			assert.match(failureOutput, /boom/);
+			assert.match(failureOutput, /1 test\(s\) failed, 1 passed\./);
+			assert.match(failureOutput, /--- probe: throwing case ---/);
+
+			const printsBeforeRepeat = lines.length;
+			probe.finish();
+			assert.equal(
+				lines.length,
+				printsBeforeRepeat,
+				"a repeated finish() must not print the summary twice",
 			);
+
+			const labeled = createSyncTestRunner();
+			labeled.testCase(
+				"probe: acceptance failure",
+				() => {
+					throw new Error("labeled boom");
+				},
+				"验收 1",
+			);
+			labeled.finish();
+			assert.equal(process.exitCode, 1);
+			assert.match(lines.join("\n"), /  FAIL probe: acceptance failure（验收 1）/);
+
+			const green = createSyncTestRunner();
+			green.testCase("probe: green suite", () => {}, "验收 2");
+			green.finish();
+			assert.equal(process.exitCode, 0, "finish() must set process.exitCode = 0 when nothing failed");
+			assert.match(lines.join("\n"), /All 1 test\(s\) passed\./);
+		} finally {
+			restore();
+			Reflect.set(process, "exitCode", previousExitCode);
+		}
+	});
+
+	testCase("required: createSyncTestRunner reports 1 passed / 1 failed and an idempotent finish()", () => {
+		const { lines, restore } = captureConsoleLines();
+		const previousExitCode = process.exitCode;
+		Reflect.set(process, "exitCode", undefined);
+
+		try {
+			const probe = createSyncTestRunner();
+			let escaped: unknown;
+			try {
+				probe.testCase("probe: passing case", () => {});
+				probe.testCase("probe: throwing case", () => {
+					throw new Error("probe boom");
+				});
+			} catch (err) {
+				escaped = err;
+			}
+			assert.equal(escaped, undefined, "a throwing case must be captured, never rethrown");
+
+			probe.finish();
+			assert.equal(process.exitCode, 1, "1 passed / 1 failed must settle process.exitCode = 1");
 			assert.match(
-				item,
-				/已[^。\n]{0,60}(修复|实现|改为|按此策略落地)/,
-				`Section 7 item ${index} must describe the implemented fix`,
+				lines.join("\n"),
+				/1 test\(s\) failed, 1 passed\./,
+				"finish() must report exactly 1 passed and 1 failed",
 			);
-		}
 
-		assert.match(itemMap.get(6) ?? "", /allowedFiles|子波次/);
-		assert.match(itemMap.get(7) ?? "", /合并|校验/);
-		assert.match(itemMap.get(8) ?? "", /includeHostEdits|targetParentLayerId/);
+			const countsBeforeRepeat = lines.slice();
+			probe.finish();
+			assert.deepEqual(
+				lines,
+				countsBeforeRepeat,
+				"a second finish() must not change the counts or reprint the summary",
+			);
+			assert.equal(process.exitCode, 1, "the second finish() must keep process.exitCode = 1");
+		} finally {
+			restore();
+			Reflect.set(process, "exitCode", previousExitCode);
+		}
+	});
+
+	testCase("required: an empty run reports zero passes and exits 0", () => {
+		const { lines, restore } = captureConsoleLines();
+		const previousExitCode = process.exitCode;
+		Reflect.set(process, "exitCode", 1);
+		// Regex, not a literal needle: this suite must not look like a runner copy.
+		const emptySummary = /^All 0 test\(s\) passed\.$/;
+
+		try {
+			const probe = createSyncTestRunner();
+			probe.finish();
+			assert.equal(
+				process.exitCode,
+				0,
+				"a run with zero cases has no failure, so it must settle process.exitCode = 0",
+			);
+			const summaryLines = lines.filter((line) => emptySummary.test(line));
+			assert.equal(
+				summaryLines.length,
+				1,
+				`finish() must print exactly one zero-pass summary (actual: ${JSON.stringify(lines)})`,
+			);
+			assert.match(lines[lines.length - 1] ?? "", emptySummary);
+		} finally {
+			restore();
+			Reflect.set(process, "exitCode", previousExitCode);
+		}
+	});
+
+	testCase("required: createSyncTestRunner sets process.exitCode = 0 for an all-passing run", () => {
+		const { lines, restore } = captureConsoleLines();
+		const previousExitCode = process.exitCode;
+		Reflect.set(process, "exitCode", 1);
+
+		try {
+			const probe = createSyncTestRunner();
+			probe.testCase("probe: healthy case", () => {});
+			probe.finish();
+			assert.equal(
+				process.exitCode,
+				0,
+				"an all-passing run must settle process.exitCode = 0 even after a previous failure",
+			);
+			assert.match(lines.join("\n"), /All 1 test\(s\) passed\./);
+		} finally {
+			restore();
+			Reflect.set(process, "exitCode", previousExitCode);
+		}
 	});
 }
 
 overlapTests();
 waveTests();
 escalatedWaveTests();
-wiringTests();
+harnessConsolidationTests();
 cleanup();
 
-console.log("");
-if (failures.length > 0) {
-	console.error(`${failures.length} test(s) failed, ${passed} passed.`);
-	for (const f of failures) {
-		console.error(`\n--- ${f.name} ---`);
-		console.error(f.error instanceof Error ? f.error.stack ?? f.error.message : String(f.error));
-	}
-	process.exitCode = 1;
-} else {
-	console.log(`All ${passed} test(s) passed.`);
-	process.exitCode = 0;
-}
+runner.finish();

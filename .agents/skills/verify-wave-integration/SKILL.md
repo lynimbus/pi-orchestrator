@@ -48,6 +48,8 @@ git diff 58c9db26656669e8d03b82de424d7c1a35966609 -- integration-state.ts index.
 
 Move the sync commit forward in this `SKILL.md` **only** after you have inspected every diff in those covered files and confirmed that `scripts/verify-wave-integration.ts` accurately models all atomic persistence steps at the new commit.
 
+**Anchors are function names, not line numbers:** after a structural refactor the `codeRef` anchors in `scripts/verify-wave-integration.ts` name functions (`index.ts:orch_integrate -> persistState`, `layerfs-engine.ts:mergeAndPublishWave -> saveMeta`) instead of file/line ranges, because line numbers drift on every refactor; `node .agents/skills/verify-wave-integration/scripts/verify-wave-integration.ts` was re-run after the refactor and passed with all 3 clauses (`1,422` states).
+
 ## Run the Check
 
 From the repository root (`/var/home/lynimbus/workspace/pi-orchestrator`), run:
@@ -64,16 +66,16 @@ node .agents/skills/verify-wave-integration/scripts/verify-wave-integration.ts
 At sync commit `58c9db26656669e8d03b82de424d7c1a35966609` (all three clauses **PASS**, exit code `0`; `1,422` reachable states, `2,016` transitions, ~45 ms):
 
 - **`NoDoubleMerge`:** **PASS** — `decideIntegrationAction` only returns `"merge"` when `plan.phase === "READY_TO_INTEGRATE"`, no integration record exists, and `store.headLayerId === plan.baseLayerId`.
-- **`NoRecoveryDeadlock`:** **PASS** — `reconcileIntegrationRecord` (`integration-state.ts:70-120`) adopts the store head whenever `headLayerId !== rec.parentLayerId`, even when `rec.publishedLayerId` still points at the wave's own merge Layer (the post-test `importHostAsLayer` window in `orch_integrate`/`orch_retry_integration`), so `rec.publishedLayerId`, `plan.baseLayerId`, and `decide{Retry,Rollback}IntegrationAction` agree on the head.
-- **`RollbackPreservesTaskStatuses`:** **PASS** — the pre-merge statuses are captured twice and never overwritten: `orch_integrate` writes `taskStatusesBeforeMerge` when it persists `status: "running"` (`index.ts:1183-1201`), `markWaveMerged` keeps an existing snapshot (`index.ts:1037-1043`), and `reconcileIntegrationRecord` captures them before flipping tasks to `"merged"` after a crash, so `orch_rollback_integration` restores `"escalated"` instead of downgrading it to `"approved"`.
+- **`NoRecoveryDeadlock`:** **PASS** — `reconcileIntegrationRecord` (`integration-state.ts:reconcileIntegrationRecord`) adopts the store head whenever `headLayerId !== rec.parentLayerId`, even when `rec.publishedLayerId` still points at the wave's own merge Layer (the post-test `importHostAsLayer` window in `orch_integrate`/`orch_retry_integration`), so `rec.publishedLayerId`, `plan.baseLayerId`, and `decide{Retry,Rollback}IntegrationAction` agree on the head.
+- **`RollbackPreservesTaskStatuses`:** **PASS** — the pre-merge statuses are captured twice and never overwritten: `orch_integrate` writes `taskStatusesBeforeMerge` when it persists `status: "running"` (`index.ts:orch_integrate`), `markWaveMerged` keeps an existing snapshot (`index.ts:markWaveMerged`), and `reconcileIntegrationRecord` captures them before flipping tasks to `"merged"` after a crash, so `orch_rollback_integration` restores `"escalated"` instead of downgrading it to `"approved"`.
 
 No open findings at the sync commit.
 
 ## Interpreting Results: Real Bug vs. Modeling Error
 
-1. **Read the shortest counterexample trace printed by the script.** Every step names the transition (`[ActionName]`), the exact file and line range (`(index.ts:...)`), and the resulting state.
+1. **Read the shortest counterexample trace printed by the script.** Every step names the transition (`[ActionName]`), the semantic code anchor (`(index.ts:orch_integrate -> persistState)`), and the resulting state.
 2. **Verify each step against the code:**
-   - Open the cited lines in `integration-state.ts`, `index.ts`, or `layerfs-engine.ts`.
+   - Open the anchored function in `integration-state.ts`, `index.ts`, or `layerfs-engine.ts`.
    - If every step in the trace corresponds to a real state transition between two disk writes (`saveMeta` in `layerfs-engine.ts` or `persistState` in `index.ts`) and the final state violates the property, **it is a real bug in the product code**.
    - If the code was intentionally refactored so that two steps in `scripts/verify-wave-integration.ts` are now persisted atomically, or a new phase/guard was added that prevents a transition the script still takes, **the model has drifted**.
 
@@ -89,7 +91,7 @@ When a change to `integration-state.ts`, `index.ts`, or `layerfs-engine.ts` alte
 ## Scope & What Is Not Covered
 
 - **Covered:** The control-plane protocol between `OrchestrationPlan` persistence (`index.ts`), pure decision/reconciliation logic (`integration-state.ts`), and LayerFS `headLayerId` advancement/rollback (`layerfs-engine.ts`) up to 2 waves, 2 tasks per wave, 2 crashes, and 2 rollbacks.
-  - **Not covered by this check:** `multiWayMergeText` / `threeWayMergeText` hunk arithmetic, `withMergedMode` mode propagation, and the nanosecond stat cache (`statCacheHit`) in `layerfs-engine.ts`. A change to line-merge or mode semantics is caught by `test.ts`, not by this verifier.
+  - **Not covered by this check:** `multiWayMergeText` hunk arithmetic, `resolveMergedMode` mode propagation, and the nanosecond stat cache (`statCacheHit`) in `layerfs-engine.ts`. A change to line-merge or mode semantics is caught by `test.ts`, not by this verifier.
 - **Not covered:**
-  - Multi-branch 3-way text merge line-hunk computation (`threeWayMergeText` and `mergeAndPublishWave` in `layerfs-engine.ts`).
+  - Multi-branch 3-way text merge line-hunk computation (`multiWayMergeText` and `mergeAndPublishWave` in `layerfs-engine.ts`).
   - Filesystem inode/stat-cache fingerprinting (`statCacheHit` in `layerfs-engine.ts`) and OS-level `fs.renameSync` crash atomicity.

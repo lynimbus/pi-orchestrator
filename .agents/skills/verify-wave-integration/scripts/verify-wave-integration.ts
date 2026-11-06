@@ -9,6 +9,8 @@
  *
  * Run from the repo root:
  *   node .agents/skills/verify-wave-integration/scripts/verify-wave-integration.ts
+ *
+ * Anchors are function names, not line numbers: line numbers drift on every refactor.
  */
 
 import {
@@ -36,9 +38,9 @@ interface ModelState {
 	layerSequence: number;
 	/** True while an `orch_integrate` or `orch_retry_integration` call is mid-flight in memory */
 	inFlightCall: "none" | "integrate_started" | "integrate_layer_published" | "integrate_plan_merged" | "integrate_post_test_imported";
-	/** In-memory local variable `parentLayerId` inside `orch_integrate` (index.ts:1178) */
+	/** In-memory local variable `parentLayerId` inside `orch_integrate` (index.ts:orch_integrate) */
 	inFlightParentLayerId?: string;
-	/** In-memory local variable `mergeResult.publishedLayerId` inside `orch_integrate` (index.ts:1251) */
+	/** In-memory local variable `mergeResult.publishedLayerId` inside `orch_integrate` (index.ts:orch_integrate) */
 	inFlightPublishedLayerId?: string;
 	/** Ground-truth wave base layer before the current wave integration attempt began */
 	waveStartLayerId: string;
@@ -277,8 +279,8 @@ function nextStates(
 	};
 
 	// =========================================================================
-	// Crash & restart transitions (`reconcileIntegrationState` in index.ts:276-281
-	// calling `reconcileIntegrationRecord` in integration-state.ts:64-101)
+	// Crash & restart transitions (`reconcileIntegrationState` in index.ts:reconcileIntegrationState
+	// calling `reconcileIntegrationRecord` in integration-state.ts:reconcileIntegrationRecord)
 	// A process crash can happen at any point while `inFlightCall !== "none"`.
 	// =========================================================================
 	if (s.inFlightCall !== "none" && s.crashCount < MAX_CRASHES) {
@@ -288,18 +290,18 @@ function nextStates(
 		crashed.inFlightPublishedLayerId = undefined;
 		crashed.crashCount += 1;
 
-		// On restart, index.ts:277 calls `reconcileIntegrationRecord(activePlan, engine.getHeadLayerId())`
+		// On restart, `reconcileIntegrationState` (index.ts) calls `reconcileIntegrationRecord(activePlan, engine.getHeadLayerId())`
 		reconcileIntegrationRecord(crashed.plan, crashed.headLayerId);
 
 		pushStep(crashed, {
 			action: "CrashAndReconcileOnRestart",
-			codeRef: "index.ts:276-281 -> integration-state.ts:64-101 (reconcileIntegrationRecord)",
+			codeRef: "index.ts:reconcileIntegrationState -> integration-state.ts:reconcileIntegrationRecord",
 			summary: `Process crashes and restarts; reconcileIntegrationRecord(plan, "${crashed.headLayerId}") runs -> phase=${crashed.plan.phase}, publishedLayerId=${crashed.plan.integration?.publishedLayerId ?? "undefined"}`,
 		});
 	}
 
 	// =========================================================================
-	// In-flight `orch_integrate` steps (index.ts:1120-1335)
+	// In-flight `orch_integrate` steps (index.ts:orch_integrate)
 	// =========================================================================
 	if (s.inFlightCall === "none") {
 		// External/out-of-band store head advancement while in READY_TO_INTEGRATE
@@ -315,14 +317,14 @@ function nextStates(
 			diverged.waveHasPublishedLayer = true;
 			pushStep(diverged, {
 				action: "StoreHeadDivergesFromPlanBase",
-				codeRef: "integration-state.ts:45-52 (headLayerId !== plan.baseLayerId guard)",
+				codeRef: "integration-state.ts:decideIntegrationAction (headLayerId !== plan.baseLayerId guard)",
 				summary: `LayerFS store head advances to ${diverged.headLayerId} while plan.baseLayerId remains ${diverged.plan.baseLayerId}`,
 			});
 		}
 
 		const decision = decideIntegrationAction(s.plan, s.headLayerId);
 		if (decision.action === "merge") {
-			// Step 1 of `orch_integrate` (index.ts:1178-1190):
+			// Step 1 of `orch_integrate` (index.ts:orch_integrate):
 			// Sets `plan.phase = "INTEGRATING"` and `plan.integration = { status: "running", parentLayerId, ... }`,
 			// then calls `persistState()`.
 			const next = cloneState(s);
@@ -349,12 +351,12 @@ function nextStates(
 			next.inFlightParentLayerId = parentLayerId;
 			pushStep(next, {
 				action: "BeginIntegratePersistRunning",
-				codeRef: "index.ts:1178-1190 (orch_integrate -> persistState)",
+				codeRef: "index.ts:orch_integrate -> persistState",
 				summary: `orch_integrate starts on Wave ${waveIdx + 1} (parentLayerId=${parentLayerId}); persists phase=INTEGRATING, integration.status=running`,
 			});
 		}
 	} else if (s.inFlightCall === "integrate_started") {
-		// Branch 2a: `mergeAndPublishWave` fails with conflict/error before publishing a layer (index.ts:1207-1248)
+		// Branch 2a: `mergeAndPublishWave` fails with conflict/error before publishing a layer (index.ts:orch_integrate merge_failed)
 		{
 			const failed = cloneState(s);
 			failed.plan.phase = "READY_TO_INTEGRATE";
@@ -368,12 +370,12 @@ function nextStates(
 			failed.inFlightParentLayerId = undefined;
 			pushStep(failed, {
 				action: "MergeFailureBeforePublish",
-				codeRef: "index.ts:1227-1248 (orch_integrate merge_failed -> persistState)",
+				codeRef: "index.ts:orch_integrate (merge_failed) -> persistState",
 				summary: "mergeAndPublishWave reports conflict before publishing a Layer; phase returns to READY_TO_INTEGRATE",
 			});
 		}
 
-		// Branch 2b: `mergeAndPublishWave` publishes new Layer `L{seq+1}` to LayerFS store and host (layerfs-engine.ts:1158-1174)
+		// Branch 2b: `mergeAndPublishWave` publishes new Layer `L{seq+1}` to LayerFS store and host (layerfs-engine.ts:mergeAndPublishWave)
 		if (s.layerSequence < MAX_LAYER_SEQ) {
 			const published = cloneState(s);
 			published.layerSequence += 1;
@@ -384,12 +386,12 @@ function nextStates(
 			published.waveHasPublishedLayer = true;
 			pushStep(published, {
 				action: "PublishWaveLayerToStore",
-				codeRef: "layerfs-engine.ts:1158-1174 (mergeAndPublishWave -> saveMeta)",
+				codeRef: "layerfs-engine.ts:mergeAndPublishWave -> saveMeta",
 				summary: `mergeAndPublishWave writes new Layer ${newLayerId} (parent ${s.inFlightParentLayerId}) and updates store headLayerId=${newLayerId}`,
 			});
 		}
 	} else if (s.inFlightCall === "integrate_layer_published") {
-		// Step 3 of `orch_integrate` (index.ts:1251-1255 + markWaveMerged at index.ts:1030-1039):
+		// Step 3 of `orch_integrate` (index.ts:orch_integrate + index.ts:markWaveMerged):
 		// Sets `plan.integration.publishedLayerId`, calls `markWaveMerged`, and calls `persistState()`.
 		const merged = cloneState(s);
 		const pubId = merged.inFlightPublishedLayerId!;
@@ -410,14 +412,14 @@ function nextStates(
 		merged.inFlightCall = "integrate_plan_merged";
 		pushStep(merged, {
 			action: "PersistWaveMergedInPlan",
-			codeRef: "index.ts:1030-1039, 1251-1255 (markWaveMerged + persistState)",
+			codeRef: "index.ts:markWaveMerged -> persistState",
 			summary: `markWaveMerged records publishedLayerId=${pubId} and taskStatusesBeforeMerge=${JSON.stringify(before)}, sets tasks to merged`,
 		});
 	} else if (s.inFlightCall === "integrate_plan_merged") {
 		// Step 4a: Integration test runs without modifying host tracked files, and either passes or fails.
-		// Step 4b: Integration test modifies tracked host files (`!verifyAfterTest.matches` at index.ts:1299),
-		// causing `engine.importHostAsLayer` (index.ts:1301) to publish a post-test sync Layer `L{seq+1}` to the store
-		// BEFORE `plan.integration.publishedLayerId` is updated and persisted at index.ts:1304-1318.
+		// Step 4b: Integration test modifies tracked host files (`!verifyAfterTest.matches` in index.ts:orch_integrate),
+		// causing `engine.importHostAsLayer` (layerfs-engine.ts:importHostAsLayer) to publish a post-test sync Layer `L{seq+1}` to the store
+		// BEFORE `plan.integration.publishedLayerId` is updated and persisted (index.ts:orch_integrate post-test sync).
 		if (s.layerSequence < MAX_LAYER_SEQ) {
 			const postTestImported = cloneState(s);
 			postTestImported.layerSequence += 1;
@@ -427,7 +429,7 @@ function nextStates(
 			postTestImported.inFlightPublishedLayerId = syncLayerId;
 			pushStep(postTestImported, {
 				action: "PostTestImportHostLayerToStore",
-				codeRef: "index.ts:1299-1303 -> layerfs-engine.ts:558-605 (importHostAsLayer -> saveMeta)",
+				codeRef: "index.ts:orch_integrate (host sync) -> layerfs-engine.ts:importHostAsLayer -> saveMeta",
 				summary: `Integration test modified tracked host files; importHostAsLayer writes post-test sync Layer ${syncLayerId} (store headLayerId=${syncLayerId}) before plan.persistState()`,
 			});
 		}
@@ -435,39 +437,39 @@ function nextStates(
 		// Finish with test PASS (no host drift)
 		pushStep(finishIntegratePass(s, false), {
 			action: "FinishIntegrateTestPass",
-			codeRef: "index.ts:1311-1315 -> index.ts:1041-1091 (finalizeWaveAfterPassingTests)",
+			codeRef: "index.ts:orch_integrate (tests passed) -> finalizeWaveAfterPassingTests",
 			summary: "Integration test exits 0; finalizeWaveAfterPassingTests persists passed state",
 		});
 
 		// Finish with test FAIL (no host drift)
 		pushStep(finishIntegrateFail(s, false), {
 			action: "FinishIntegrateTestFail",
-			codeRef: "index.ts:1317-1325 (orch_integrate test failed -> persistState)",
+			codeRef: "index.ts:orch_integrate (test failed) -> persistState",
 			summary: "Integration test exits non-zero; persists phase=INTEGRATION_FAILED, integration.status=failed",
 		});
 	} else if (s.inFlightCall === "integrate_post_test_imported") {
 		// After `importHostAsLayer` updated `headLayerId`, `orch_integrate` updates `plan.baseLayerId`
-		// and `plan.integration.publishedLayerId` in memory (index.ts:1304-1305) and persists pass or fail.
+		// and `plan.integration.publishedLayerId` in memory (index.ts:orch_integrate post-test sync) and persists pass or fail.
 		pushStep(finishIntegratePass(s, true), {
 			action: "FinishIntegrateTestPassAfterHostSync",
-			codeRef: "index.ts:1304-1315 (postTestLayer sync + finalizeWaveAfterPassingTests)",
+			codeRef: "index.ts:orch_integrate (post-test sync) -> finalizeWaveAfterPassingTests",
 			summary: `Updates plan.baseLayerId and publishedLayerId to ${s.inFlightPublishedLayerId} and persists passed state`,
 		});
 
 		pushStep(finishIntegrateFail(s, true), {
 			action: "FinishIntegrateTestFailAfterHostSync",
-			codeRef: "index.ts:1304-1325 (postTestLayer sync + test failed -> persistState)",
+			codeRef: "index.ts:orch_integrate (post-test sync, test failed) -> persistState",
 			summary: `Updates plan.baseLayerId and publishedLayerId to ${s.inFlightPublishedLayerId} and persists phase=INTEGRATION_FAILED`,
 		});
 	}
 
 	// =========================================================================
-	// `orch_retry_integration` transitions (index.ts:1357-1435)
+	// `orch_retry_integration` transitions (index.ts:orch_retry_integration)
 	// =========================================================================
 	if (s.inFlightCall === "none") {
 		const retryDecision = decideRetryIntegrationAction(s.plan, s.headLayerId);
 		if (retryDecision.allowed) {
-			// Retry passes (index.ts:1402-1408 -> finalizeWaveAfterPassingTests)
+			// Retry passes (index.ts:orch_retry_integration -> finalizeWaveAfterPassingTests)
 			{
 				const retryPass = cloneState(s);
 				retryPass.plan.phase = "INTEGRATING";
@@ -476,12 +478,12 @@ function nextStates(
 				const finalized = finalizeWaveInModel(retryPass);
 				pushStep(finalized, {
 					action: "RetryIntegrationPass",
-					codeRef: "index.ts:1387-1408 (orch_retry_integration -> finalizeWaveAfterPassingTests)",
+					codeRef: "index.ts:orch_retry_integration -> finalizeWaveAfterPassingTests",
 					summary: "orch_retry_integration re-runs tests without re-merging; tests pass",
 				});
 			}
 
-			// Retry fails (index.ts:1410-1421)
+			// Retry fails (index.ts:orch_retry_integration failed)
 			if ((s.plan.integration?.attempts ?? 1) < 2) {
 				const retryFail = cloneState(s);
 				retryFail.plan.integration!.attempts += 1;
@@ -489,7 +491,7 @@ function nextStates(
 				retryFail.plan.phase = "INTEGRATION_FAILED";
 				pushStep(retryFail, {
 					action: "RetryIntegrationFail",
-					codeRef: "index.ts:1387-1421 (orch_retry_integration failed -> persistState)",
+					codeRef: "index.ts:orch_retry_integration (failed) -> persistState",
 					summary: "orch_retry_integration re-runs tests; tests fail again, staying in INTEGRATION_FAILED",
 				});
 			}
@@ -497,7 +499,7 @@ function nextStates(
 	}
 
 	// =========================================================================
-	// `orch_rollback_integration` transition (index.ts:1456-1505)
+	// `orch_rollback_integration` transition (index.ts:orch_rollback_integration)
 	// =========================================================================
 	if (s.inFlightCall === "none" && s.rollbackCount < MAX_ROLLBACKS) {
 		const rollbackDecision = decideRollbackIntegrationAction(s.plan, s.headLayerId);
@@ -506,10 +508,10 @@ function nextStates(
 			const rec = rolled.plan.integration!;
 			const targetParent = rec.parentLayerId;
 			// `engine.rollbackPublishedLayer(rec.publishedLayerId, { targetParentLayerId: rec.parentLayerId })`
-			// resets store headLayerId to targetParent (layerfs-engine.ts:1656-1657).
+			// resets store headLayerId to targetParent (layerfs-engine.ts:rollbackPublishedLayer).
 			rolled.headLayerId = targetParent ?? "";
 
-			// index.ts:1475-1481 restores task statuses from `rec.taskStatusesBeforeMerge ?? {}`
+			// index.ts:orch_rollback_integration restores task statuses from `rec.taskStatusesBeforeMerge ?? {}`
 			const before = rec.taskStatusesBeforeMerge ?? {};
 			for (const id of rolled.plan.waves[rec.waveIndex] ?? []) {
 				const task = rolled.plan.tasks[id];
@@ -524,7 +526,7 @@ function nextStates(
 
 			const stepTrace: TraceStep = {
 				action: "RollbackIntegration",
-				codeRef: "index.ts:1469-1486 (orch_rollback_integration -> rollbackPublishedLayer + restore statuses)",
+				codeRef: "index.ts:orch_rollback_integration -> layerfs-engine.ts:rollbackPublishedLayer -> restore statuses",
 				summary: `orch_rollback_integration restores store headLayerId=${rolled.headLayerId}, plan.baseLayerId=${rolled.plan.baseLayerId}, and wave task statuses`,
 			};
 			const nextTrace = [...trace, stepTrace];
@@ -662,7 +664,7 @@ function runExhaustiveVerification(): number {
 				trace: [
 					{
 						action: "Init",
-						codeRef: "index.ts:816-864 (orch_plan + orch_review -> READY_TO_INTEGRATE)",
+						codeRef: "index.ts:orch_plan / orch_review -> READY_TO_INTEGRATE",
 						summary: `Initial configuration: ${cfg.label}, baseLayerId=L1, headLayerId=L1`,
 					},
 				],

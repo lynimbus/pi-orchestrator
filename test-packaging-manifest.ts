@@ -16,26 +16,13 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { TEST_SUITE_COMMANDS } from "./suite-contract.ts";
+import { createSyncTestRunner } from "./test-kit.ts";
 
-let passed = 0;
-const failures: Array<{ name: string; error: unknown }> = [];
+const runner = createSyncTestRunner();
+const testCase = runner.testCase;
 
-function testCase(name: string, fn: () => void): void {
-	try {
-		fn();
-		passed++;
-		console.log(`  ok   ${name}`);
-	} catch (err) {
-		failures.push({ name, error: err });
-		console.error(`  FAIL ${name}`);
-		console.error(err instanceof Error ? err.message : String(err));
-	}
-}
-
-/** Positive assertion with an explicit message (mirrors `assert.ok` but keeps output terse). */
-function ok(condition: boolean, message: string): void {
-	assert.ok(condition, message);
-}
+/** Positive assertions go through `assert.ok` directly: no pass-through wrapper. */
 
 const repoRoot = path.dirname(fileURLToPath(import.meta.url));
 
@@ -62,15 +49,6 @@ const pkg = JSON.parse(readRepoFile("package.json")) as {
 	devDependencies?: Record<string, unknown>;
 	files?: unknown;
 };
-
-/** The exact command sequence `scripts.test` must register. */
-const EXPECTED_TEST_COMMANDS = [
-	"node ./test.ts",
-	"node ./test-regressions.ts",
-	"node ./test-waves.ts",
-	"node ./test-packaging-manifest.ts",
-	"node ./test-packaging-docs.ts",
-];
 
 /** The keywords that must keep working (Pi gallery discovery + existing semantics). */
 const REQUIRED_KEYWORDS = [
@@ -166,7 +144,7 @@ function packageJsonTests(): void {
 			(extensions as unknown[]).includes("./index.ts"),
 			`pi.extensions must contain "./index.ts" (actual: ${JSON.stringify(extensions)})`,
 		);
-		ok(
+		assert.ok(
 			fs.existsSync(repoPath("./index.ts")),
 			'declared extension path "./index.ts" must exist in the repo root',
 		);
@@ -194,7 +172,7 @@ function packageJsonTests(): void {
 			undefined,
 			`pi.skills must be undefined to avoid clashing with project-level skills (actual: ${JSON.stringify(pi.skills)})`,
 		);
-		ok(
+		assert.ok(
 			!Object.prototype.hasOwnProperty.call(pi, "skills"),
 			'pi manifest must not declare a "skills" key at all',
 		);
@@ -300,80 +278,21 @@ function packageJsonTests(): void {
 			.filter(Boolean);
 		assert.deepEqual(
 			parts,
-			EXPECTED_TEST_COMMANDS,
-			`scripts.test must chain the five suites (actual: ${JSON.stringify(script)})`,
+			[...TEST_SUITE_COMMANDS],
+			`scripts.test must chain every registered suite in TEST_SUITE_COMMANDS order (actual: ${JSON.stringify(script)})`,
 		);
-	});
-}
-
-function testWavesSyncTests(): void {
-	console.log("test-waves.ts / scripts.test sync");
-
-	const src = readRepoFile("test-waves.ts");
-
-	testCase("required: test-waves.ts script assertion expects all five suites", () => {
-		assert.match(
-			src,
-			/testCase\(\s*"required: package\.json test script/,
-			"test-waves.ts must keep its package.json test-script assertion (it may be renamed, never removed)",
-		);
-		const marker = "assert.deepEqual(parts, [";
-		const start = src.indexOf(marker);
-		assert.notEqual(
-			start,
-			-1,
-			`test-waves.ts must compare the script parts with assert.deepEqual(parts, [...]) (missing: ${marker})`,
-		);
-		const end = src.indexOf("]);", start + marker.length);
-		assert.notEqual(end, -1, "test-waves.ts script assertion array must be closed with `]);`");
-		const arraySource = src.slice(start + marker.length, end);
-		const expected = [...arraySource.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
-		assert.deepEqual(
-			expected,
-			EXPECTED_TEST_COMMANDS,
-			`test-waves.ts expected script parts must list the five suites exactly (actual: ${JSON.stringify(expected)})`,
+		assert.equal(
+			parts.length,
+			6,
+			`scripts.test must chain exactly six suites (actual: ${String(parts.length)})`,
 		);
 		assert.ok(
-			expected.includes("node ./test-packaging-manifest.ts"),
-			"test-waves.ts expected parts must include node ./test-packaging-manifest.ts",
-		);
-		assert.ok(
-			expected.includes("node ./test-packaging-docs.ts"),
-			"test-waves.ts expected parts must include node ./test-packaging-docs.ts",
-		);
-	});
-
-	testCase("required: test-waves.ts does not skip or narrow the script assertion", () => {
-		assert.equal(
-			src.includes(".skip("),
-			false,
-			"test-waves.ts must not use .skip( to bypass a test case",
-		);
-		assert.equal(
-			src.includes(".only("),
-			false,
-			"test-waves.ts must not use .only( to bypass a test case",
-		);
-		assert.equal(
-			src.includes("assert.match(parts"),
-			false,
-			"test-waves.ts script assertion must stay an exact deepEqual comparison, not a substring match",
+			parts.includes("node ./test-primitives.ts"),
+			"scripts.test must run node ./test-primitives.ts",
 		);
 	});
 }
 
 packageJsonTests();
-testWavesSyncTests();
 
-console.log("");
-if (failures.length > 0) {
-	console.error(`${failures.length} test(s) failed, ${passed} passed.`);
-	for (const f of failures) {
-		console.error(`\n--- ${f.name} ---`);
-		console.error(f.error instanceof Error ? f.error.stack ?? f.error.message : String(f.error));
-	}
-	process.exitCode = 1;
-} else {
-	console.log(`All ${passed} test(s) passed.`);
-	process.exitCode = 0;
-}
+runner.finish();

@@ -36,7 +36,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { LayerFSEngine, matchesAnyPattern } from "./layerfs-engine.ts";
+import { LayerFSEngine } from "./layerfs-engine.ts";
+import { matchesAnyPattern } from "./path-patterns.ts";
 import {
 	decideIntegrationAction,
 	decideRetryIntegrationAction,
@@ -104,9 +105,6 @@ function toRelPath(cwd: string, targetPath: string): string {
 	return rel.replace(/\\/g, "/");
 }
 
-/**
- * Worker-side guard when this extension loads inside a spawned Subagent Worker process.
- */
 function setupSubagentWorkerMode(pi: ExtensionAPI): void {
 	const taskId = process.env.PI_ORCHESTRATOR_TASK_ID || "worker";
 	let allowedPatterns: string[] = [];
@@ -153,7 +151,6 @@ function setupSubagentWorkerMode(pi: ExtensionAPI): void {
 }
 
 export default function orchestratorExtension(pi: ExtensionAPI): void {
-	// If running inside a child Subagent Worker process, activate lightweight worker scope guard only.
 	if (process.env.PI_ORCHESTRATOR_WORKER === "1") {
 		setupSubagentWorkerMode(pi);
 		return;
@@ -163,7 +160,6 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	let activePlan: OrchestrationPlan | null = null;
 	let autoContinueNudgeCount = 0;
 
-	// Register CLI flags
 	pi.registerFlag("orch", {
 		description: "Start with strict Lead-Subagent TDD Orchestrator workflow enabled",
 		type: "boolean",
@@ -182,19 +178,6 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		return new LayerFSEngine(cwd, activePlan?.projectId);
 	}
 
-	interface StatusDiagnostics {
-		hostVerification?: {
-			matches: boolean;
-			mismatches: string[];
-			checked: number;
-			layerId: string;
-		};
-		headFileCount?: number;
-		parentFileCount?: number;
-		treeRegression?: boolean;
-	}
-
-	/** Cheap, non-throwing consistency diagnostics for `/orch status`. */
 	function collectStatusDiagnostics(engine: LayerFSEngine): StatusDiagnostics {
 		const diag: StatusDiagnostics = {};
 		try {
@@ -308,9 +291,21 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		});
 	}
 
-	// =========================================================================
-	// Orchestration Tools for the Lead Agent
-	// =========================================================================
+	function commitState(ctx: ExtensionContext): void {
+		persistState();
+		updateUI(ctx);
+	}
+
+	function renderStatus(ctx: ExtensionContext): string {
+		const engine = getEngine(ctx.cwd);
+		return formatOrchestratorStatusReport(
+			config,
+			activePlan,
+			engine.getMetrics(),
+			ctx,
+			collectStatusDiagnostics(engine),
+		);
+	}
 
 	const TaskSpecSchema = Type.Object({
 		id: Type.String({ description: "Short unique task ID, e.g. 'T1', 'T2'" }),
@@ -501,8 +496,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			};
 
 			autoContinueNudgeCount = 0;
-			persistState();
-			updateUI(ctx);
+			commitState(ctx);
 
 			const waveLines = waves.map(
 				(w, i) =>
@@ -588,8 +582,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				record.state.baseLayerId = newLayer.layerId;
 			}
 
-			persistState();
-			updateUI(ctx);
+			commitState(ctx);
 
 			return {
 				content: [
@@ -713,10 +706,8 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			});
 
 			activePlan.phase = "REVIEWING";
-			persistState();
-			updateUI(ctx);
+			commitState(ctx);
 
-			// Build the Lead Agent Review Packet: ONLY diffs, unit tests, and mechanical gate results!
 			const packetSections: string[] = [];
 			packetSections.push(
 				`# Wave ${activePlan.currentWaveIndex + 1} Review Packet (Subagent Model: \`${effectiveModel || "default"}\`, Thinking: \`${effectiveThinking || "default"}\`)`,
@@ -883,8 +874,6 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 					isError: true,
 				};
 			}
-			// Re-approving an already merged wave could flip the phase back to
-			// READY_TO_INTEGRATE and open the door to a duplicate merge.
 			// READY_TO_INTEGRATE is kept available so a task can still be rejected
 			// (e.g. after a merge conflict) before any Layer has been published.
 			// INTEGRATING / INTEGRATION_FAILED / COMPLETED are blocked: re-approving a
@@ -997,8 +986,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				);
 			}
 
-			persistState();
-			updateUI(ctx);
+			commitState(ctx);
 
 			return {
 				content: [{ type: "text", text: messages.join("\n") }],
@@ -1007,16 +995,12 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// =========================================================================
 	// Integration state machine (idempotency, crash recovery, retry, rollback)
-	// =========================================================================
 
-	/** Reconcile a plan interrupted mid-integration (pure logic in integration-state.ts). */
 	function reconcileIntegrationState(engine: LayerFSEngine, ctx: ExtensionContext): void {
 		if (!activePlan) return;
 		if (reconcileIntegrationRecord(activePlan, engine.getHeadLayerId())) {
-			persistState();
-			updateUI(ctx);
+			commitState(ctx);
 		}
 	}
 
@@ -1071,8 +1055,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				plan.tasks[id].state.baseLayerId = plan.baseLayerId;
 			}
 			plan.integration = undefined;
-			persistState();
-			updateUI(ctx);
+			commitState(ctx);
 			return [
 				`✓ Integration test \`${result.command}\` passed (${result.durationMs}ms)${viaRetry ? " on retry" : ""}.`,
 				hostLine,
@@ -1083,8 +1066,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		}
 
 		plan.phase = "COMPLETED";
-		persistState();
-		updateUI(ctx);
+		commitState(ctx);
 		return [
 			`🎉 Orchestration COMPLETE — all ${plan.waves.length} wave(s) integrated.`,
 			`- Final integration test \`${result.command}\` passed (${result.durationMs}ms)${viaRetry ? " on retry" : ""}.`,
@@ -1200,8 +1182,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				testCommand: plan.integrationTestCommand,
 				taskStatusesBeforeMerge,
 			};
-			persistState();
-			updateUI(ctx);
+			commitState(ctx);
 
 			const approvedBranches = currentWaveIds
 				.filter((id) => plan.tasks[id].state.status === "approved")
@@ -1226,8 +1207,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 					lastError: err instanceof Error ? err.message : String(err),
 					updatedAt: Date.now(),
 				};
-				persistState();
-				updateUI(ctx);
+				commitState(ctx);
 				return {
 					content: [
 						{
@@ -1247,8 +1227,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 					lastError: mergeResult.error ?? "Unresolved merge conflicts",
 					updatedAt: Date.now(),
 				};
-				persistState();
-				updateUI(ctx);
+				commitState(ctx);
 				const conflictText = mergeResult.conflicts
 					.map(
 						(c) =>
@@ -1297,8 +1276,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				hostDrift: mergeResult.hostDrift,
 				updatedAt: Date.now(),
 			};
-			persistState();
-			updateUI(ctx);
+			commitState(ctx);
 
 			const integrationResult = await executeWorkspaceCommand(
 				plan.integrationTestCommand,
@@ -1320,8 +1298,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 					lastError: `Integration test exited ${integrationResult.exitCode}`,
 				};
 				plan.phase = "INTEGRATION_FAILED";
-				persistState();
-				updateUI(ctx);
+				commitState(ctx);
 				return {
 					content: [
 						{
@@ -1442,8 +1419,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				rec.testDiagnostics = formatCommandDiagnostics(result);
 				rec.lastError = `Integration test retry #${rec.attempts} exited ${result.exitCode}`;
 				plan.phase = "INTEGRATION_FAILED";
-				persistState();
-				updateUI(ctx);
+				commitState(ctx);
 				return {
 					content: [
 						{
@@ -1529,8 +1505,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			plan.currentWaveIndex = rec.waveIndex;
 			plan.phase = "READY_TO_INTEGRATE";
 			plan.integration = undefined;
-			persistState();
-			updateUI(ctx);
+			commitState(ctx);
 
 			return {
 				content: [
@@ -1555,28 +1530,16 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		description: "Inspect current Orchestrator configuration, active plan wave progress, and LayerFS deduplication metrics.",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			const engine = getEngine(ctx.cwd);
-			const metrics = engine.getMetrics();
 			return {
 				content: [
 					{
 						type: "text",
-						text: formatOrchestratorStatusReport(
-							config,
-							activePlan,
-							metrics,
-							ctx,
-							collectStatusDiagnostics(engine),
-						),
+						text: renderStatus(ctx),
 					},
 				],
 			};
 		},
 	});
-
-	// =========================================================================
-	// Hard Enforcement Hooks (Lead Agent)
-	// =========================================================================
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!config.enabled) return;
@@ -1613,7 +1576,6 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 	pi.on("tool_call", async (event, ctx) => {
 		if (!config.enabled) return;
 
-		// Enforce Lead Agent write/edit restrictions
 		if (event.toolName === "write" || event.toolName === "edit") {
 			const input = event.input as Record<string, any>;
 			const rawPath = String(input.path || input.file_path || "");
@@ -1708,10 +1670,6 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 		};
 	});
 
-	// =========================================================================
-	// Interactive Commands & Shortcuts (/orch and Ctrl+Alt+O)
-	// =========================================================================
-
 	pi.registerShortcut("ctrl+alt+o", {
 		description: "Toggle Orchestrator Mode ON/OFF",
 		handler: async (ctx) => {
@@ -1719,8 +1677,7 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 			if (!config.enabled) {
 				activePlan = null;
 			}
-			persistState();
-			updateUI(ctx);
+			commitState(ctx);
 			ctx.ui.notify(
 				config.enabled
 					? `⚡ Orchestrator Mode ENABLED (subagent model: ${config.subagentModel || "inherit"}, thinking: ${config.subagentThinkingLevel || "inherit"})`
@@ -1739,8 +1696,7 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 
 			if (sub === "on" || sub === "enable") {
 				config.enabled = true;
-				persistState();
-				updateUI(ctx);
+				commitState(ctx);
 				ctx.ui.notify(
 					`⚡ Orchestrator Mode ENABLED (subagent model: ${config.subagentModel || "inherit"}, thinking: ${config.subagentThinkingLevel || "inherit"})`,
 					"info",
@@ -1751,8 +1707,7 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 			if (sub === "off" || sub === "disable") {
 				config.enabled = false;
 				activePlan = null;
-				persistState();
-				updateUI(ctx);
+				commitState(ctx);
 				ctx.ui.notify("Orchestrator Mode DISABLED", "info");
 				return;
 			}
@@ -1760,8 +1715,7 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 			if (sub === "toggle") {
 				config.enabled = !config.enabled;
 				if (!config.enabled) activePlan = null;
-				persistState();
-				updateUI(ctx);
+				commitState(ctx);
 				ctx.ui.notify(
 					`Orchestrator Mode ${config.enabled ? "ENABLED" : "DISABLED"}`,
 					"info",
@@ -1774,8 +1728,7 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 				if (argModel) {
 					config.subagentModel =
 						argModel === "inherit" || argModel === "default" ? undefined : argModel;
-					persistState();
-					updateUI(ctx);
+					commitState(ctx);
 					ctx.ui.notify(
 						`Subagent model set to: ${config.subagentModel || "(inherit lead model)"}`,
 						"info",
@@ -1800,8 +1753,7 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 						);
 						return;
 					}
-					persistState();
-					updateUI(ctx);
+					commitState(ctx);
 					ctx.ui.notify(
 						`Subagent thinking level set to: ${config.subagentThinkingLevel || "(inherit lead thinking)"}`,
 						"info",
@@ -1815,26 +1767,17 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 			if (sub === "reset" || sub === "clear") {
 				activePlan = null;
 				autoContinueNudgeCount = 0;
-				persistState();
-				updateUI(ctx);
+				commitState(ctx);
 				ctx.ui.notify("Active orchestration plan reset.", "info");
 				return;
 			}
 
 			if (sub === "status") {
-				const engine = getEngine(ctx.cwd);
-				const report = formatOrchestratorStatusReport(
-					config,
-					activePlan,
-					engine.getMetrics(),
-					ctx,
-					collectStatusDiagnostics(engine),
-				);
+				const report = renderStatus(ctx);
 				ctx.ui.notify(report, "info");
 				return;
 			}
 
-			// Interactive Menu when `/orch` is called without arguments
 			await openInteractiveOrchMenu(ctx);
 		},
 	});
@@ -1843,7 +1786,6 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 		const options: string[] = ["(inherit lead model)"];
 		const seen = new Set<string>();
 
-		// Prefer scoped models if configured, then all available models from modelRegistry
 		if (ctx.scopedModels && ctx.scopedModels.length > 0) {
 			for (const entry of ctx.scopedModels) {
 				const id = `${entry.model.provider}/${entry.model.id}`;
@@ -1889,8 +1831,7 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 			config.subagentModel = choice;
 		}
 
-		persistState();
-		updateUI(ctx);
+		commitState(ctx);
 		ctx.ui.notify(
 			`Subagent model set to: ${config.subagentModel || "(inherit lead model)"}`,
 			"info",
@@ -1918,8 +1859,7 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 			config.subagentThinkingLevel = clean;
 		}
 
-		persistState();
-		updateUI(ctx);
+		commitState(ctx);
 		ctx.ui.notify(
 			`Subagent thinking level set to: ${config.subagentThinkingLevel || "(inherit lead thinking)"}`,
 			"info",
@@ -1947,8 +1887,7 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 		if (selected.startsWith("1.")) {
 			config.enabled = !config.enabled;
 			if (!config.enabled) activePlan = null;
-			persistState();
-			updateUI(ctx);
+			commitState(ctx);
 			ctx.ui.notify(
 				`Orchestrator Workflow ${config.enabled ? "ENABLED ⚡" : "DISABLED"}`,
 				"info",
@@ -1998,27 +1937,15 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 				"info",
 			);
 		} else if (selected.startsWith("8.")) {
-			const engine = getEngine(ctx.cwd);
-			const report = formatOrchestratorStatusReport(
-				config,
-				activePlan,
-				engine.getMetrics(),
-				ctx,
-				collectStatusDiagnostics(engine),
-			);
+			const report = renderStatus(ctx);
 			ctx.ui.notify(report, "info");
 		} else if (selected.startsWith("9.")) {
 			activePlan = null;
 			autoContinueNudgeCount = 0;
-			persistState();
-			updateUI(ctx);
+			commitState(ctx);
 			ctx.ui.notify("Active orchestration plan reset.", "info");
 		}
 	}
-
-	// =========================================================================
-	// Session Lifecycle Restoration
-	// =========================================================================
 
 	pi.on("session_start", async (_event, ctx) => {
 		config = loadConfig();
@@ -2038,7 +1965,6 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 			config.subagentThinkingLevel = flagThinking.trim() as ThinkingLevel;
 		}
 
-		// Restore activePlan from session entries if resuming a session
 		const entries = ctx.sessionManager.getEntries();
 		const lastEntry = entries
 			.filter((e: any) => e.type === "custom" && e.customType === "orchestrator-state")
@@ -2064,7 +1990,7 @@ function formatBytes(bytes: number): string {
 	return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
-interface StatusReportDiagnostics {
+interface StatusDiagnostics {
 	hostVerification?: {
 		matches: boolean;
 		mismatches: string[];
@@ -2081,7 +2007,7 @@ function formatOrchestratorStatusReport(
 	plan: OrchestrationPlan | null,
 	metrics: ReturnType<LayerFSEngine["getMetrics"]>,
 	ctx: ExtensionContext,
-	diag?: StatusReportDiagnostics,
+	diag?: StatusDiagnostics,
 ): string {
 	const leadModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown";
 	const lines: string[] = [

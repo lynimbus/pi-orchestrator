@@ -13,12 +13,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { LayerFSEngine } from "./layerfs-engine.ts";
+import { superviseChildProcess } from "./process-runner.ts";
 import type {
 	TaskRecord,
 	TaskSpec,
 	UsageStats,
 } from "./types.ts";
 import { runMechanicalVerificationGate } from "./verifier.ts";
+import { scratchDirs, scratchEnvironment } from "./workspace-env.ts";
 
 export interface SubagentDispatchOptions {
 	model?: string;
@@ -202,8 +204,6 @@ export async function runWaveTaskSubagent(
 	state.recentActivity = [`Mounting LayerFS workspace for ${state.branchName}...`];
 	options.onProgress?.();
 
-	// If first attempt, fork branch and mount workspace.
-	// On retry, reuse existing branch & workspace (or re-mount from branch head if unmounted).
 	let wsInfo: {
 		workspacePath: string;
 		tmpDir: string;
@@ -218,8 +218,7 @@ export async function runWaveTaskSubagent(
 	} else if (state.workspacePath && fs.existsSync(state.workspacePath)) {
 		wsInfo = {
 			workspacePath: state.workspacePath,
-			tmpDir: path.join(state.workspacePath, ".tmp"),
-			cacheDir: path.join(state.workspacePath, ".cache"),
+			...scratchDirs(state.workspacePath),
 			headCommitId: state.headCommitId,
 			baseLayerId: state.baseLayerId!,
 		};
@@ -270,51 +269,11 @@ export async function runWaveTaskSubagent(
 					PI_ORCHESTRATOR_TASK_ID: spec.id,
 					PI_ORCHESTRATOR_ALLOWED_FILES: JSON.stringify(allowedCombined),
 					PI_ORCHESTRATOR_FORBIDDEN_FILES: JSON.stringify(spec.doNotTouch ?? []),
-					TMPDIR: wsInfo.tmpDir,
-					XDG_CACHE_HOME: wsInfo.cacheDir,
+					...scratchEnvironment(wsInfo),
 				},
 			});
 
 			let stdoutLineBuf = "";
-			let settled = false;
-			let forcedExitCode: number | undefined;
-			let killTimer: ReturnType<typeof setTimeout> | undefined;
-			let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
-			let killProc: (() => void) | undefined;
-
-			const finish = (code: number) => {
-				if (settled) return;
-				settled = true;
-				if (killTimer) clearTimeout(killTimer);
-				if (timeoutTimer) clearTimeout(timeoutTimer);
-				if (options.signal && killProc) {
-					options.signal.removeEventListener("abort", killProc);
-				}
-				if (stdoutLineBuf.trim()) processJsonLine(stdoutLineBuf);
-				resolve(code);
-			};
-
-			// SIGTERM first, unconditional SIGKILL escalation afterwards. `proc.killed`
-			// is already true right after the first kill(), so it must not be used as the
-			// guard (that used to leave hung workers alive forever).
-			const terminate = (code: number, label: string) => {
-				if (settled || forcedExitCode !== undefined) return;
-				forcedExitCode = code;
-				stderrBuf += `\n[${label}]`;
-				try {
-					proc.kill("SIGTERM");
-				} catch {
-					finish(code);
-					return;
-				}
-				killTimer = setTimeout(() => {
-					try {
-						proc.kill("SIGKILL");
-					} catch {
-						finish(code);
-					}
-				}, 3000);
-			};
 
 			const processJsonLine = (line: string) => {
 				if (!line.trim()) return;
@@ -371,19 +330,19 @@ export async function runWaveTaskSubagent(
 				if (stderrBuf.length > 16384) stderrBuf = stderrBuf.slice(-16384);
 			});
 
-			proc.on("close", (code) => finish(forcedExitCode ?? code ?? 1));
-			proc.on("error", () => finish(1));
-
-			timeoutTimer = setTimeout(
-				() => terminate(124, `Worker timeout after ${workerTimeoutMs}ms: SIGTERM`),
-				workerTimeoutMs,
-			);
-
-			if (options.signal) {
-				killProc = () => terminate(130, "Aborted by signal: SIGTERM");
-				if (options.signal.aborted) killProc();
-				else options.signal.addEventListener("abort", killProc, { once: true });
-			}
+			// Timeout (124) / abort (130) / spawn error (1) policy lives in process-runner.ts.
+			superviseChildProcess(proc, {
+				timeoutMs: workerTimeoutMs,
+				signal: options.signal,
+				onTerminate: (label) => {
+					stderrBuf += `\n[${label}]`;
+				},
+				onProcessError: () => 1,
+				onFinish: (code: number) => {
+					if (stdoutLineBuf.trim()) processJsonLine(stdoutLineBuf);
+					resolve(code);
+				},
+			});
 		});
 
 		if (exitCode !== 0 && !lastAssistantText) {
@@ -393,7 +352,6 @@ export async function runWaveTaskSubagent(
 					: stderrBuf.trim() || `Subagent exited with code ${exitCode}`;
 		}
 
-		// Commit workspace state via Compare-And-Swap on the LayerFS branch
 		state.recentActivity = [...(state.recentActivity ?? []).slice(-5), "Committing LayerFS snapshot & running Mechanical Gate..."];
 		options.onProgress?.();
 
@@ -404,11 +362,9 @@ export async function runWaveTaskSubagent(
 		);
 		state.headCommitId = commit.commitId;
 
-		// Compute unified diff separated into Implementation vs Unit Tests
 		const diff = engine.diffBranch(state.branchName, spec.testFiles);
 		state.diff = diff;
 
-		// Run Layer 1 Mechanical Verification Gate
 		const { gateReport, workerReport } = await runMechanicalVerificationGate(
 			spec,
 			wsInfo.workspacePath,

@@ -13,9 +13,16 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { TEST_SUITE_COMMANDS } from "./suite-contract.ts";
+import { createSyncTestRunner } from "./test-kit.ts";
+
+const runner = createSyncTestRunner();
 
 const HERE = import.meta.dirname ?? path.dirname(fileURLToPath(import.meta.url));
 const README_PATH = path.join(HERE, "README.md");
+
+/** The exact `&&`-chained command line that `npm test` must document. */
+const SIX_STAGE_CHAIN = TEST_SUITE_COMMANDS.join(" && ");
 
 const LEGACY_PATH = "~/.pi/agent/extensions/orchestrator";
 const GIT_PACKAGE = "git:github.com/lynimbus/pi-orchestrator";
@@ -42,10 +49,6 @@ function test(name: string, acceptance: string, run: () => void): void {
 	tests.push({ name, acceptance, run });
 }
 
-/* ------------------------------------------------------------------ */
-/* helpers                                                             */
-/* ------------------------------------------------------------------ */
-
 function expectIncludes(haystack: string, needle: string, label: string): void {
 	if (!haystack.includes(needle)) {
 		throw new Error(`${label}：期望包含 \`${needle}\`，实际缺失（README.md 中未找到该字符串）`);
@@ -58,12 +61,20 @@ function expectNotIncludes(haystack: string, needle: string, label: string): voi
 	}
 }
 
+function readRepoFile(relPath: string): string {
+	const abs = path.join(HERE, relPath);
+	try {
+		return fs.readFileSync(abs, "utf-8");
+	} catch (err) {
+		throw new Error(`无法读取 ${relPath}（${abs}）：${(err as Error).message}`);
+	}
+}
+
 function findLineNumber(needle: string): number {
 	const idx = lines.findIndex((line) => line.includes(needle));
 	return idx < 0 ? -1 : idx + 1;
 }
 
-/** Returns the markdown body of `## <title>` (heading excluded, next `## ` heading excluded). */
 function getSection(title: string): string {
 	const start = lines.findIndex((line) => line.startsWith(`## ${title}`));
 	if (start < 0) {
@@ -76,10 +87,6 @@ function getSection(title: string): string {
 }
 
 const RESTART_CONTEXT_KEYWORDS = ["重启", "/reload"];
-
-/* ------------------------------------------------------------------ */
-/* required test cases                                                 */
-/* ------------------------------------------------------------------ */
 
 test(
 	"首行标题为 `# Pi Orchestrator` 且不含旧本地路径",
@@ -209,32 +216,159 @@ test(
 );
 
 test(
-	"`## 本地开发` 与 `## 测试` 的 npm test 注释同步为五段链",
+	"`## 本地开发` 与 `## 测试` 的 npm test 注释同步为六段链",
 	"重试反馈 2 / 验收 5",
 	() => {
-		const fiveStage =
-			"node ./test.ts && node ./test-regressions.ts && node ./test-waves.ts && node ./test-packaging-manifest.ts && node ./test-packaging-docs.ts";
-		expectIncludes(getSection("本地开发"), fiveStage, "`## 本地开发` npm test 五段链注释");
-		expectIncludes(getSection("测试"), fiveStage, "`## 测试` npm test 五段链注释");
+		const sixStage = SIX_STAGE_CHAIN;
+		expectIncludes(getSection("本地开发"), sixStage, "`## 本地开发` npm test 六段链注释");
+		expectIncludes(getSection("测试"), sixStage, "`## 测试` npm test 六段链注释");
 		// 源码中不存在只写三段的 npm test 注释
 		const commented = lines.filter((line) => /npm test\s+#/.test(line));
 		if (commented.length === 0) {
 			throw new Error("npm test 注释：期望至少有一行 `npm test    # ...` 形式的分阶段注释，实际缺失");
 		}
 		for (const line of commented) {
-			for (const stage of [
-				"node ./test.ts",
-				"node ./test-regressions.ts",
-				"node ./test-waves.ts",
-				"node ./test-packaging-manifest.ts",
-				"node ./test-packaging-docs.ts",
-			]) {
+			for (const stage of TEST_SUITE_COMMANDS) {
 				if (!line.includes(stage)) {
 					throw new Error(
-						`npm test 注释：期望行内包含 \`${stage}\`（五段链完整），实际缺失。违规行：${line.trim()}`,
+						`npm test 注释：期望行内包含 \`${stage}\`（六段链完整），实际缺失。违规行：${line.trim()}`,
 					);
 				}
 			}
+		}
+	},
+);
+
+test(
+	"README 的 npm test 链与 suite-contract.ts 的 TEST_SUITE_COMMANDS 逐段一致（六段）",
+	"验收 1 / 用例 1",
+	() => {
+		if (TEST_SUITE_COMMANDS.length !== 6) {
+			throw new Error(
+				`TEST_SUITE_COMMANDS：期望 6 段，实际 ${TEST_SUITE_COMMANDS.length} 段（${TEST_SUITE_COMMANDS.join(" && ")}）`,
+			);
+		}
+		expectIncludes(SIX_STAGE_CHAIN, "node ./test-primitives.ts", "六段链最后一段");
+		for (const title of ["本地开发", "测试"]) {
+			expectIncludes(getSection(title), SIX_STAGE_CHAIN, `\`## ${title}\` 六段链与单源顺序一致`);
+		}
+	},
+);
+
+test(
+	"`## 测试` 列出 node ./test-primitives.ts 的单独运行命令并写进覆盖说明",
+	"验收 1 / 用例 1",
+	() => {
+		const testing = getSection("测试");
+		expectIncludes(testing, "- `node ./test-primitives.ts`", "`## 测试` 原语测试条目");
+		expectIncludes(testing, "test-primitives.ts` 覆盖", "`## 测试` 覆盖说明中的原语测试");
+		expectIncludes(testing, "path-patterns", "`## 测试` 覆盖说明列出 path-patterns");
+		expectIncludes(testing, "process-runner", "`## 测试` 覆盖说明列出 process-runner");
+		expectIncludes(testing, "suite-contract", "`## 测试` 覆盖说明列出 suite-contract");
+	},
+);
+
+test(
+	"README 只声称六段链，不再出现五段链表述",
+	"验收 1",
+	() => {
+		expectIncludes(readme, "六段链", "README 段数表述");
+		expectNotIncludes(readme, "五段链", "README 陈旧段数表述");
+		expectNotIncludes(readme, "四段链", "README 陈旧段数表述");
+	},
+);
+
+test(
+	"SKILL.md 不引用已删除的 withMergedMode / threeWayMergeText 并解释语义锚点",
+	"验收 3 / 用例 2",
+	() => {
+		const skill = readRepoFile(".agents/skills/verify-wave-integration/SKILL.md");
+		expectNotIncludes(skill, "withMergedMode", "SKILL.md 已删除的 withMergedMode 包装");
+		expectNotIncludes(skill, "threeWayMergeText", "SKILL.md 已删除的 threeWayMergeText 包装");
+		expectIncludes(skill, "resolveMergedMode", "SKILL.md 指向真实的 resolveMergedMode");
+		expectIncludes(skill, "multiWayMergeText", "SKILL.md 指向真实的 multiWayMergeText");
+		expectIncludes(skill, "function names", "SKILL.md 语义锚点说明");
+		expectIncludes(skill, "not line numbers", "SKILL.md 语义锚点说明");
+		expectIncludes(
+			skill,
+			"node .agents/skills/verify-wave-integration/scripts/verify-wave-integration.ts",
+			"SKILL.md 复跑命令",
+		);
+		expectIncludes(skill, "all 3 clauses", "SKILL.md 复跑结论");
+	},
+);
+
+test(
+	"verify-wave-integration.ts 的 codeRef 全部是函数名锚点，不含行号范围",
+	"验收 4 / 用例 2",
+	() => {
+		const script = readRepoFile(
+			path.join(".agents", "skills", "verify-wave-integration", "scripts", "verify-wave-integration.ts"),
+		);
+		const lineRef = /\.ts:\s*\d/.exec(script);
+		if (lineRef) {
+			const at = script.slice(0, lineRef.index).split(/\r?\n/).length;
+			throw new Error(
+				`verify-wave-integration.ts：期望不再出现 \`file.ts:<行号>\` 锚点，实际第 ${at} 行出现 \`${lineRef[0]}\``,
+			);
+		}
+		expectIncludes(
+			script,
+			"Anchors are function names, not line numbers: line numbers drift on every refactor.",
+			"verify-wave-integration.ts 锚点头注释",
+		);
+		const refs = [...script.matchAll(/codeRef:\s*"([^"]+)"/g)].map((m) => m[1]);
+		if (refs.length < 15) {
+			throw new Error(`codeRef 数量：期望至少 15 条语义锚点，实际 ${refs.length} 条`);
+		}
+		for (const ref of refs) {
+			if (!/^[a-z-]+\.ts:[A-Za-z_]/.test(ref)) {
+				throw new Error(`codeRef 语义锚点格式：期望形如 \`index.ts:orch_integrate -> persistState\`，实际 \`${ref}\``);
+			}
+		}
+		for (const clause of ["NoDoubleMerge", "NoRecoveryDeadlock", "RollbackPreservesTaskStatuses"]) {
+			expectIncludes(script, clause, `verify-wave-integration.ts 子句 ${clause}`);
+		}
+	},
+);
+
+test(
+	"docs/ablation-report.md 具备六段结构与精确基线指标",
+	"验收 5 / 用例 4",
+	() => {
+		const report = readRepoFile("docs/ablation-report.md");
+		for (const heading of [
+			"## 目标与方法",
+			"## 基线指标",
+			"## 问题清单与修复决策",
+			"## 消融记录",
+			"## 保留的特殊情况",
+			"## 结论与复测命令",
+			"## 最终指标（由 Lead 在最后一波后填写）",
+		]) {
+			expectIncludes(report, heading, `docs/ablation-report.md 结构：${heading}`);
+		}
+		for (const number of [
+			"5899",
+			"3066",
+			"3/3",
+			"1422",
+			"threeWayMergeText",
+			"withMergedMode",
+			"StatusDiagnostics",
+			"mismatches.length >= 50",
+			"2000ms",
+			"3000ms",
+			"16",
+		]) {
+			expectIncludes(report, number, `docs/ablation-report.md 基线指标：${number}`);
+		}
+		expectIncludes(report, "5826", "docs/ablation-report.md 最终规模（追加波 1 / 2 后）：生产代码 5826 行");
+		for (const fix of ["F1", "F2", "F3", "F4", "F5", "F6", "F7"]) {
+			expectIncludes(report, `### ${fix} `, `docs/ablation-report.md 决策日志：${fix}`);
+		}
+		for (const wave of ["Wave 1", "Wave 2", "Wave 3"]) {
+			expectIncludes(report, wave, `docs/ablation-report.md 消融记录：${wave}`);
 		}
 	},
 );
@@ -257,13 +391,12 @@ test(
 		const dev = getSection("本地开发");
 		expectIncludes(dev, "git clone https://github.com/lynimbus/pi-orchestrator", "`## 本地开发` 克隆仓库");
 		expectIncludes(dev, "npm test", "`## 本地开发` 测试命令");
-		expectIncludes(dev, "test-packaging-manifest.ts", "`## 本地开发` npm test 五段链中的包清单测试");
-		expectIncludes(dev, "test-packaging-docs.ts", "`## 本地开发` npm test 五段链中的文档测试");
+		expectIncludes(dev, "test-packaging-manifest.ts", "`## 本地开发` npm test 六段链中的包清单测试");
+		expectIncludes(dev, "test-packaging-docs.ts", "`## 本地开发` npm test 六段链中的文档测试");
 		expectIncludes(dev, "pi install ./", "`## 本地开发` 本地安装调试");
 		expectIncludes(dev, "pi -e ./index.ts", "`## 本地开发` 临时加载");
 		expectIncludes(dev, "pi remove ./", "`## 本地开发` 摘掉本地声明");
 		expectIncludes(dev, ".agents/skills/verify-wave-integration", "`## 本地开发` 形式化验证技能");
-		// global assertions for the same anchors
 		expectIncludes(readme, "npm test", "本地开发锚点");
 		expectIncludes(readme, "pi install ./", "本地开发锚点");
 		expectIncludes(readme, ".agents/skills/verify-wave-integration", "本地开发锚点");
@@ -359,9 +492,6 @@ test(
 	},
 );
 
-/* ------------------------------------------------------------------ */
-/* extra guards                                                        */
-/* ------------------------------------------------------------------ */
 
 test(
 	"README 不再把手抄本地目录当作安装位置指引",
@@ -401,29 +531,5 @@ test(
 	},
 );
 
-/* ------------------------------------------------------------------ */
-/* runner                                                              */
-/* ------------------------------------------------------------------ */
-
-let passed = 0;
-const failures: string[] = [];
-
-for (const testCase of tests) {
-	try {
-		testCase.run();
-		passed += 1;
-		console.log(`✓ ${testCase.name}`);
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		failures.push(`✗ ${testCase.name}（${testCase.acceptance}）\n  ${message}`);
-		console.error(`✗ ${testCase.name}（${testCase.acceptance}）\n  ${message}`);
-	}
-}
-
-if (failures.length > 0) {
-	console.error(`\n${failures.length} test(s) failed, ${passed} passed.`);
-	process.exit(1);
-}
-
-console.log(`\nAll ${passed} test(s) passed.`);
-process.exit(0);
+for (const t of tests) runner.testCase(t.name, t.run, t.acceptance);
+runner.finish();

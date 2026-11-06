@@ -66,7 +66,6 @@ function listHostFiles(host: string): string[] {
  */
 const fsCjs = createRequire(import.meta.url)("node:fs") as typeof fs;
 
-/** Records every `fs.readFileSync` that targets a file inside `host` (host-relative paths). */
 function patchHostReads(host: string): {
 	reads: string[];
 	reset: () => void;
@@ -286,7 +285,6 @@ function testSnapshotVerifyAndRollback() {
 	assert.equal(readHost(host, "new.txt"), "new\n");
 	assert.equal(engine.verifyHostMatchesLayer("L2").matches, true);
 
-	// Drift detection
 	fs.writeFileSync(path.join(host, "base.txt"), "v3\n", "utf-8");
 	const drift = engine.verifyHostMatchesLayer("L2");
 	assert.equal(drift.matches, false);
@@ -406,7 +404,6 @@ function testUnrelatedHostDriftIsReportedNotFatal() {
 	fs.writeFileSync(path.join(ws.workspacePath, "new.txt"), "new\n", "utf-8");
 	engine.commitWorkspace("b1", "work", b.headCommitId);
 
-	// Simulate a direct escalated lead edit on an unrelated file before integration.
 	fs.writeFileSync(path.join(host, "other.txt"), "edited by lead\n", "utf-8");
 
 	const merged = engine.mergeAndPublishWave(["b1"], {
@@ -585,13 +582,11 @@ function testIntegrationCrashRecovery() {
 	assert.equal(reconcileIntegrationRecord(p3, "L3"), false);
 	assert.equal(p3.phase, "COMPLETED");
 
-	// ---------------------------------------------------------------------
 	// Finding: RollbackPreservesTaskStatuses
 	// A crash-recovered merge must remember which tasks were escalated before
 	// they were flipped to "merged", so rolling back cannot silently downgrade
 	// them to "approved" (which would drop the Lead Agent's host edits on the
 	// next integrate attempt).
-	// ---------------------------------------------------------------------
 	const p4 = makePlan({
 		waves: [["T1", "T2"]],
 		statuses: { T1: "approved", T2: "escalated" },
@@ -619,13 +614,11 @@ function testIntegrationCrashRecovery() {
 		"rollback after crash recovery must not downgrade an escalated task to approved",
 	);
 
-	// ---------------------------------------------------------------------
 	// Finding: NoRecoveryDeadlock
 	// The integration test mutated tracked host files, so `orch_integrate`
 	// imported the post-test host state as a new Layer (head L4) and the process
 	// died before persisting `publishedLayerId`. Reconcile must adopt the real
 	// head, otherwise retry/rollback stay blocked forever.
-	// ---------------------------------------------------------------------
 	const p5 = makePlan({
 		statuses: { T1: "merged" },
 		parentLayerId: "L2",
@@ -838,7 +831,6 @@ function testIncludeHostEditsMergeAndRollback() {
 		"the root layer has no parent and needs no pre-image snapshot",
 	);
 
-	// Approved branch work: modify a.txt + the tail of shared.txt.
 	const b1 = engine.forkBranch("task-t1", "L1");
 	const ws = engine.mountWorkspace("task-t1");
 	fs.writeFileSync(path.join(ws.workspacePath, "a.txt"), "a-branch\n", "utf-8");
@@ -849,7 +841,6 @@ function testIncludeHostEditsMergeAndRollback() {
 	);
 	engine.commitWorkspace("task-t1", "branch work", b1.headCommitId);
 
-	// Direct host edits: modify b.txt, add c.txt, delete d.txt, edit the head of shared.txt.
 	fs.writeFileSync(path.join(host, "b.txt"), "b-host\n", "utf-8");
 	fs.writeFileSync(path.join(host, "c.txt"), "c-host\n", "utf-8");
 	fs.rmSync(path.join(host, "d.txt"));
@@ -870,7 +861,6 @@ function testIncludeHostEditsMergeAndRollback() {
 	assert.equal(merged.treeRegressionWarning, undefined, "the merged tree keeps the file count of L1");
 	assert.equal(engine.loadLayer("L2").parentLayerId, "L1");
 
-	// Branch edit + host edits are all merged into the published layer and the host.
 	assert.equal(readHost(host, "a.txt"), "a-branch\n");
 	assert.equal(readHost(host, "b.txt"), "b-host\n");
 	assert.equal(readHost(host, "c.txt"), "c-host\n");
@@ -896,7 +886,6 @@ function testIncludeHostEditsMergeAndRollback() {
 	assert.equal(snapshot.files["d.txt"].existed, true, "deleted host files must be restorable");
 	assert.equal(snapshot.files["c.txt"].existed, false, "host-added files must be removed on rollback");
 
-	// Rolling back L2 must restore the host byte-for-byte to L1.
 	const rollback = engine.rollbackPublishedLayer("L2");
 	assert.equal(rollback.ok, true, rollback.message);
 	assert.equal(rollback.restoredLayerId, "L1");
@@ -1003,8 +992,7 @@ function testMultiLayerRollback() {
 	track(engine, host);
 	const storeRoot = engine.getMetrics().storeRoot;
 
-	engine.importHostAsLayer("initial import"); // L1
-	// L2: approved branch work.
+	engine.importHostAsLayer("initial import");
 	const b1 = engine.forkBranch("task-t1", "L1");
 	const ws = engine.mountWorkspace("task-t1");
 	fs.writeFileSync(path.join(ws.workspacePath, "a.txt"), "a2\n", "utf-8");
@@ -1055,7 +1043,6 @@ function testMultiLayerRollback() {
 	);
 	fs.writeFileSync(l2SnapshotPath, l2SnapshotRaw, "utf-8");
 
-	// Atomic multi-layer rollback: L3 -> L2 -> L1.
 	const rollback = engine.rollbackPublishedLayer("L3", { targetParentLayerId: "L1" });
 	assert.equal(rollback.ok, true, rollback.message);
 	assert.equal(rollback.restoredLayerId, "L1");
@@ -1067,7 +1054,6 @@ function testMultiLayerRollback() {
 	assert.equal(readHost(host, "e.txt"), undefined, "L3-added file must be removed");
 	assert.equal(engine.verifyHostMatchesLayer("L1").matches, true);
 
-	// Single-layer rollback of a host import layer still works.
 	fs.writeFileSync(path.join(host, "a.txt"), "a4\n", "utf-8");
 	const l4 = engine.importHostAsLayer("second direct host edit", { expectedParentLayerId: "L1" });
 	assert.equal(l4.layerId, "L4", "rolled-back layer ids are never recycled (audit trail)");
@@ -1077,6 +1063,82 @@ function testMultiLayerRollback() {
 	assert.equal(single.restoredLayerId, "L1");
 	assert.equal(single.hostMatchesLayer, true);
 	assert.equal(readHost(host, "a.txt"), "a1\n");
+}
+
+/**
+ * Behavioral wiring oracle for the two runtime modules `index.ts` delegates to.
+ *
+ * `index.ts` cannot be imported at runtime here (it depends on Pi host packages), so the
+ * contract that still matters at this seam is asserted through the real modules: the command
+ * runner really spawns a child and reports its exit code, and the integration decision
+ * function really answers merge / blocked / no-op for real plan states.
+ */
+async function testCommandRunnerAndDecisionBehavior() {
+	const host = makeHost({ "oracle.txt": "oracle\n" });
+	hosts.push(host);
+
+	const okRun = await executeWorkspaceCommand(`node -e 'process.stdout.write("ok")'`, host);
+	assert.equal(okRun.exitCode, 0, "a successful command must report exitCode 0");
+	assert.match(okRun.outputHead, /ok/, "command stdout must be captured in the output head");
+	const failingRun = await executeWorkspaceCommand("node -e 'process.exit(3)'", host);
+	assert.equal(failingRun.exitCode, 3, "a command exiting 3 must report exitCode 3");
+
+	const mergeDecision = decideIntegrationAction(
+		{
+			phase: "READY_TO_INTEGRATE",
+			baseLayerId: "L1",
+			currentWaveIndex: 0,
+			waves: [["task-a"]],
+			tasks: {},
+		} as unknown as OrchestrationPlan,
+		"L1",
+	);
+	assert.equal(
+		mergeDecision.action,
+		"merge",
+		"a wave ready to integrate from the current head must merge",
+	);
+	assert.match(mergeDecision.reason, /L1/);
+
+	const blockedDecision = decideIntegrationAction(
+		{
+			phase: "READY_TO_INTEGRATE",
+			baseLayerId: "L1",
+			currentWaveIndex: 0,
+			waves: [["task-a"]],
+			tasks: {},
+		} as unknown as OrchestrationPlan,
+		"L2",
+	);
+	assert.equal(
+		blockedDecision.action,
+		"blocked",
+		"a head that drifted past the plan base must block the merge",
+	);
+	assert.match(blockedDecision.reason, /diverged/);
+
+	const noopDecision = decideIntegrationAction(
+		{
+			phase: "READY_TO_INTEGRATE",
+			baseLayerId: "L1",
+			currentWaveIndex: 0,
+			waves: [["task-a"]],
+			tasks: {},
+			integration: {
+				waveIndex: 0,
+				status: "passed",
+				parentLayerId: "L1",
+				publishedLayerId: "L3",
+				startedAt: 0,
+				updatedAt: 0,
+				attempts: 1,
+				testExitCode: 0,
+			},
+		} as unknown as OrchestrationPlan,
+		"L3",
+	);
+	assert.equal(noopDecision.action, "no-op", "an already-published wave must never merge twice");
+	assert.match(noopDecision.reason, /already integrated/);
 }
 
 async function runTests() {
@@ -1097,6 +1159,7 @@ async function runTests() {
 		["multi-layer rollback to targetParentLayerId", testMultiLayerRollback],
 		["integration state machine guards", testIntegrationStateMachine],
 		["integration crash recovery", testIntegrationCrashRecovery],
+		["command runner + integration decision behavior", testCommandRunnerAndDecisionBehavior],
 	];
 
 	let failed = 0;

@@ -69,7 +69,7 @@ pi update --extensions                              # 更新全部已安装的�
 ```bash
 git clone https://github.com/lynimbus/pi-orchestrator
 cd pi-orchestrator
-npm test        # node ./test.ts && node ./test-regressions.ts && node ./test-waves.ts && node ./test-packaging-manifest.ts && node ./test-packaging-docs.ts
+npm test        # node ./test.ts && node ./test-regressions.ts && node ./test-waves.ts && node ./test-packaging-manifest.ts && node ./test-packaging-docs.ts && node ./test-primitives.ts
 ```
 
 本地调试有两种方式，都指向当前工作目录，不写死绝对路径：
@@ -160,15 +160,19 @@ pi --orch --orch-model group/deepseek --orch-thinking medium
 ## 测试
 
 ```bash
-npm test    # node ./test.ts && node ./test-regressions.ts && node ./test-waves.ts && node ./test-packaging-manifest.ts && node ./test-packaging-docs.ts
+npm test    # node ./test.ts && node ./test-regressions.ts && node ./test-waves.ts && node ./test-packaging-manifest.ts && node ./test-packaging-docs.ts && node ./test-primitives.ts
 ```
 
-`npm test` 现在是**五段链**，也可以按需单独跑某一段：
+`npm test` 现在是**六段链**，也可以按需单独跑某一段：
 
 - `node ./test.ts`：核心编排 / LayerFS 行为
 - `node ./test-regressions.ts`：回归用例
 - `node ./test-waves.ts`：多波次与派发用例
 - `node ./test-packaging-manifest.ts`：包清单契约（`package.json` 的 `pi.extensions`、入口文件、`npm test` 脚本段数等）
 - `node ./test-packaging-docs.ts`：纯文本契约测试，保证这份 README 的安装/更新/迁移叙事不会退回「手工拷贝目录」的老写法
+- `node ./test-primitives.ts`：共享原语单测（`path-patterns.ts` 的路径归一化 / glob 匹配、`workspace-env.ts` 的 scratch 目录、`process-runner.ts` 的超时与 SIGTERM→SIGKILL、`suite-contract.ts` 的测试套件命令单一来源）
 
-`test-regressions.ts` 覆盖：重复 integrate 被拒且宿主不变、跨分支新增文件不丢、宿主快照/校验/回滚/重合并、可执行位、非相关漂移、TMPDIR/诊断/超时、损坏 meta、source root 绑定、集成状态机。
+覆盖说明：
+
+- `test-regressions.ts` 覆盖：重复 integrate 被拒且宿主不变、跨分支新增文件不丢、宿主快照/校验/回滚/重合并、可执行位、非相关漂移、TMPDIR/诊断/超时、损坏 meta、source root 绑定、集成状态机。
+- `test-primitives.ts` 覆盖：`path-patterns.ts`、`workspace-env.ts`、`process-runner.ts`、`suite-contract.ts` 四个共享原语的单元行为，以及它们与 `suite-contract.ts` 中 `TEST_SUITE_COMMANDS`（六段）的一致性。

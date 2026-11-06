@@ -20,6 +20,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isTestFilePath, matchesAnyPattern } from "./path-patterns.ts";
 import type {
 	BranchDiffResult,
 	FileChangeEntry,
@@ -27,6 +28,7 @@ import type {
 	StoreMetrics,
 	WaveMergeResult,
 } from "./types.ts";
+import { ensureScratchDirs, SCRATCH_DIR_NAMES } from "./workspace-env.ts";
 
 export interface TreeEntry {
 	type: "file" | "symlink";
@@ -44,7 +46,6 @@ export interface LayerRecord {
 	createdAt: number;
 	message: string;
 	tree: TreeManifest;
-	/** Set when the imported tree loses files relative to its parent layer */
 	treeRegressionWarning?: string;
 }
 
@@ -130,29 +131,20 @@ const SHARED_DEPENDENCY_DIRS = new Set([
 	".nuxt",
 ]);
 
-/** Directories never imported into LayerFS canonical store or workspaces */
+/** Directories never imported into LayerFS canonical store or workspaces.
+ * `.tmp` / `.cache` are NOT repeated here: they are spread from `SCRATCH_DIR_NAMES`,
+ * the single source of truth for the scratch-directory convention. */
 const IGNORED_DIRS = new Set([
 	".git",
 	".jj",
 	".hg",
 	".svn",
-	".tmp",
-	".cache",
+	...SCRATCH_DIR_NAMES,
 	".layerfs-orch",
 ]);
 
-const TEST_FILE_PATTERNS = [
-	/(^|\/)tests?\//i,
-	/(^|\/)__tests__\//i,
-	/\.(test|spec)\.[a-z0-9]+$/i,
-	/_test\.[a-z0-9]+$/i,
-	/^test_[^/]+\.[a-z0-9]+$/i,
-];
-
-export function isTestFilePath(relPath: string): boolean {
-	const normalized = relPath.replace(/\\/g, "/");
-	return TEST_FILE_PATTERNS.some((re) => re.test(normalized));
-}
+/** Upper bound on reported host mismatches (a drifted host can mismatch thousands of paths). */
+const MAX_HOST_MISMATCHES = 50;
 
 function isSecretFileName(name: string): boolean {
 	if (name === ".env" || (name.startsWith(".env.") && !name.endsWith(".example") && !name.endsWith(".sample") && !name.endsWith(".template"))) {
@@ -161,58 +153,6 @@ function isSecretFileName(name: string): boolean {
 	if (name === "id_rsa" || name === "id_ed25519" || name === "id_ecdsa") return true;
 	if (name.endsWith(".pem") || name.endsWith(".key") || name.endsWith(".p12")) return true;
 	return false;
-}
-
-export function matchGlobPattern(relPath: string, pattern: string): boolean {
-	const cleanPath = relPath.replace(/\\/g, "/").replace(/^\.\//, "");
-	const cleanPattern = pattern.replace(/\\/g, "/").replace(/^\.\//, "");
-
-	if (cleanPath === cleanPattern) return true;
-	if (cleanPattern.endsWith("/") && cleanPath.startsWith(cleanPattern)) return true;
-	if (!cleanPattern.includes("*") && !cleanPattern.includes("?")) {
-		// Exact file or directory prefix match
-		if (cleanPath.startsWith(`${cleanPattern}/`)) return true;
-		return cleanPath === cleanPattern;
-	}
-
-	// Convert glob to regex
-	let regexStr = "^";
-	let i = 0;
-	while (i < cleanPattern.length) {
-		const c = cleanPattern[i];
-		if (c === "*" && cleanPattern[i + 1] === "*") {
-			if (cleanPattern[i + 2] === "/") {
-				regexStr += "(?:.+/)?";
-				i += 3;
-				continue;
-			}
-			regexStr += ".*";
-			i += 2;
-			continue;
-		}
-		if (c === "*") {
-			regexStr += "[^/]*";
-			i++;
-			continue;
-		}
-		if (c === "?") {
-			regexStr += "[^/]";
-			i++;
-			continue;
-		}
-		if (".+^${}()|[]\\".includes(c)) {
-			regexStr += `\\${c}`;
-		} else {
-			regexStr += c;
-		}
-		i++;
-	}
-	regexStr += "$";
-	return new RegExp(regexStr).test(cleanPath);
-}
-
-export function matchesAnyPattern(relPath: string, patterns: string[]): boolean {
-	return patterns.some((p) => matchGlobPattern(relPath, p));
 }
 
 export class LayerFSEngine {
@@ -227,7 +167,6 @@ export class LayerFSEngine {
 	private readonly projectId: string;
 	private readonly sourceRoot: string;
 
-	/** In-memory view of `stat-cache.json`: host relPath -> nanosecond fingerprint. */
 	private statCache?: Map<string, StatCacheEntry>;
 	private statCacheDirty = false;
 
@@ -324,7 +263,6 @@ export class LayerFSEngine {
 		}
 	}
 
-	// ------------------------------------------------------------------
 	// Nanosecond stat cache (issue 7)
 	//
 	// Re-reading every host file just to prove it is unchanged makes full-tree
@@ -333,7 +271,6 @@ export class LayerFSEngine {
 	// us reuse the canonical ObjectId without touching the file contents. Calling
 	// `lstatSync` after a write also sets I_CTIME_QUERIED on the inode, guaranteeing
 	// later modifications advance the timestamps we compare against.
-	// ------------------------------------------------------------------
 
 	private getStatCache(): Map<string, StatCacheEntry> {
 		if (this.statCache) return this.statCache;
@@ -469,7 +406,6 @@ export class LayerFSEngine {
 
 				if (lstat.isSymbolicLink()) {
 					const linkTarget = fs.readlinkSync(fullPath);
-					// Skip symlinks that point to shared dependency dirs we created
 					if (SHARED_DEPENDENCY_DIRS.has(entry.name)) continue;
 					const buf = Buffer.from(linkTarget, "utf-8");
 					const objectId = this.writeCanonicalBlob(buf, meta);
@@ -495,7 +431,6 @@ export class LayerFSEngine {
 					if (cacheEnabled) {
 						const cached = this.statCacheHit(relPath, statBig);
 						if (cached && this.hasCanonicalBlob(cached.objectId)) {
-							// Unchanged bytes: reuse the canonical ObjectId without re-reading.
 							manifest[relPath] = {
 								type: "file",
 								objectId: cached.objectId,
@@ -553,9 +488,6 @@ export class LayerFSEngine {
 		return JSON.parse(fs.readFileSync(p, "utf-8")) as CommitRecord;
 	}
 
-	/**
-	 * Imports the current host directory state as a new immutable Layer in the LayerStack.
-	 */
 	public importHostAsLayer(
 		message: string,
 		options: { expectedParentLayerId?: string } = {},
@@ -607,7 +539,6 @@ export class LayerFSEngine {
 		this.saveLayer(layer);
 		meta.headLayerId = layerId;
 
-		// Also create an initial baseline commit for main reference
 		meta.commitSequence += 1;
 		const commitId = `C${meta.commitSequence}`;
 		const baseCommit: CommitRecord = {
@@ -631,10 +562,6 @@ export class LayerFSEngine {
 		return layer;
 	}
 
-	/**
-	 * Forks a writable Branch from the specified base Layer (or current head Layer).
-	 * O(1) metadata operation — zero file copies.
-	 */
 	public forkBranch(branchName: string, baseLayerId?: string): BranchRecord {
 		const meta = this.loadMeta();
 		const targetLayerId = baseLayerId || meta.headLayerId;
@@ -667,10 +594,6 @@ export class LayerFSEngine {
 		return branch;
 	}
 
-	/**
-	 * Mounts an ephemeral Workspace for a Branch and returns its filesystem projection path
-	 * along with isolated scratch directories (.tmp and .cache).
-	 */
 	public mountWorkspace(branchName: string): {
 		workspacePath: string;
 		tmpDir: string;
@@ -686,16 +609,12 @@ export class LayerFSEngine {
 		const commit = this.loadCommit(branch.headCommitId);
 		const safeBranchDir = branchName.replace(/[^\w.-]+/g, "_");
 		const wsRoot = path.join(this.workspacesDir, safeBranchDir, "root");
-		const tmpDir = path.join(wsRoot, ".tmp");
-		const cacheDir = path.join(wsRoot, ".cache");
 
-		// Clean and project exact branch head tree
 		if (fs.existsSync(wsRoot)) {
 			fs.rmSync(wsRoot, { recursive: true, force: true });
 		}
 		fs.mkdirSync(wsRoot, { recursive: true });
-		fs.mkdirSync(tmpDir, { recursive: true });
-		fs.mkdirSync(cacheDir, { recursive: true });
+		const { tmpDir, cacheDir } = ensureScratchDirs(wsRoot);
 
 		for (const [relPath, entry] of Object.entries(commit.tree)) {
 			const destPath = path.join(wsRoot, relPath);
@@ -704,7 +623,7 @@ export class LayerFSEngine {
 				try {
 					fs.symlinkSync(entry.symlinkTarget, destPath);
 				} catch {
-					// Ignore dangling symlink collision
+					// A dangling target is not fatal: the projected file still exists as a link.
 				}
 			} else {
 				const buf = this.readCanonicalBlob(entry.objectId);
@@ -712,7 +631,6 @@ export class LayerFSEngine {
 			}
 		}
 
-		// Link shared read-only heavy dependency directories from host if present
 		try {
 			const hostEntries = fs.readdirSync(this.sourceRoot, { withFileTypes: true });
 			for (const entry of hostEntries) {
@@ -723,7 +641,7 @@ export class LayerFSEngine {
 						try {
 							fs.symlinkSync(hostDepPath, wsDepPath);
 						} catch {
-							// Best-effort symlink
+							// A failed link only costs disk space, it must not fail the mount.
 						}
 					}
 				}
@@ -950,7 +868,6 @@ export class LayerFSEngine {
 		/** Paths explicitly deleted by a branch (relative to its OWN fork base) */
 		const explicitDeletions = new Set<string>();
 
-		// Track per-path modifications across branches
 		const pathTouchMap = new Map<
 			string,
 			Array<{
@@ -1037,7 +954,6 @@ export class LayerFSEngine {
 		}
 
 		if (pathTouchMap.size === 0) {
-			// Nothing changed on any branch and (when enabled) nothing changed on the host.
 			return noop();
 		}
 
@@ -1069,10 +985,8 @@ export class LayerFSEngine {
 				continue;
 			}
 
-			// Multiple branches touched the same path
 			const uniqueObjectIds = new Set(touches.map((t) => t.entry?.objectId ?? "DELETED"));
 			if (uniqueObjectIds.size === 1) {
-				// Convergent identical change across branches! Deduplicates cleanly.
 				const firstEntry = touches[0].entry;
 				if (!firstEntry) {
 					delete mergedTree[relPath];
@@ -1082,7 +996,7 @@ export class LayerFSEngine {
 						fromBranches: touches.map((t) => t.branchName),
 					});
 				} else {
-					mergedTree[relPath] = withMergedMode(baseEntry, firstEntry, touches);
+					mergedTree[relPath] = { ...firstEntry, mode: resolveMergedMode(baseEntry, touches) };
 					mergedFiles.push({
 						path: relPath,
 						changeType: baseEntry ? "modified" : "added",
@@ -1092,7 +1006,6 @@ export class LayerFSEngine {
 				continue;
 			}
 
-			// Check if 3-way line merge is possible (all touches are regular text files and baseEntry exists)
 			const allRegularFiles =
 				Boolean(baseEntry && baseEntry.type === "file") &&
 				touches.every((t) => t.entry && t.entry.type === "file");
@@ -1137,7 +1050,6 @@ export class LayerFSEngine {
 				continue;
 			}
 
-			// Otherwise record conflict
 			const branchObjectIds: Record<string, string | undefined> = {};
 			for (const t of touches) branchObjectIds[t.branchName] = t.entry?.objectId;
 			conflicts.push({
@@ -1176,7 +1088,6 @@ export class LayerFSEngine {
 			);
 		}
 
-		// Publish new Layer and atomically apply delta to host sourceRoot
 		meta.layerSequence += 1;
 		const newLayerId = `L${meta.layerSequence}`;
 		const contributorNames = contributors.map((c) => c.name);
@@ -1259,7 +1170,6 @@ export class LayerFSEngine {
 		this.saveLayer(newLayer);
 		meta.headLayerId = newLayerId;
 
-		// Clean up ephemeral workspaces of merged branches
 		for (const branchName of branchNames) {
 			this.unmountWorkspace(branchName, meta);
 		}
@@ -1474,103 +1384,101 @@ export class LayerFSEngine {
 		const paths = onlyPaths ? Array.from(new Set(onlyPaths)) : Object.keys(tree);
 
 		for (const relPath of paths) {
-			const entry = tree[relPath];
 			checked++;
-			const full = this.safeHostPath(relPath);
-
-			if (!entry) {
-				// Deleted by the merged tree: the host path must no longer exist.
-				let present = true;
-				try {
-					fs.lstatSync(full, { bigint: true });
-				} catch (err) {
-					const code = (err as NodeJS.ErrnoException)?.code;
-					present = !(code === "ENOENT" || code === "ENOTDIR");
-				}
-				if (present) {
-					mismatches.push(`${relPath}: expected deleted file to be absent`);
-				} else {
-					this.deleteStatCacheEntry(relPath);
-				}
-				if (mismatches.length >= 50) break;
-				continue;
-			}
-
-			const stat = (() => {
-				try {
-					return fs.lstatSync(full, { bigint: true });
-				} catch {
-					return undefined;
-				}
-			})();
-			if (!stat) {
-				mismatches.push(`${relPath}: missing or unreadable`);
-				this.deleteStatCacheEntry(relPath);
-				if (mismatches.length >= 50) break;
-				continue;
-			}
-
-			if (entry.type === "symlink") {
-				let ok = false;
-				try {
-					ok = stat.isSymbolicLink() && fs.readlinkSync(full) === entry.symlinkTarget;
-				} catch {
-					ok = false;
-				}
-				if (!ok) {
-					mismatches.push(`${relPath}: symlink mismatch`);
-					this.deleteStatCacheEntry(relPath);
-				} else {
-					this.updateStatCache(relPath, stat, entry.objectId);
-				}
-				if (mismatches.length >= 50) break;
-				continue;
-			}
-
-			if (!stat.isFile()) {
-				mismatches.push(`${relPath}: not a regular file`);
-				this.deleteStatCacheEntry(relPath);
-				if (mismatches.length >= 50) break;
-				continue;
-			}
-
-			if (!strictPaths) {
-				const cached = this.statCacheHit(relPath, stat);
-				if (cached && this.hasCanonicalBlob(cached.objectId)) {
-					// Provably unchanged bytes: compare ObjectIds without reading the file.
-					if (cached.objectId !== entry.objectId) {
-						mismatches.push(`${relPath}: content mismatch`);
-					}
-					if (mismatches.length >= 50) break;
-					continue;
-				}
-			}
-
-			const actualId = (() => {
-				try {
-					const buf = fs.readFileSync(full);
-					const header = Buffer.from(`blob ${buf.byteLength}\0`, "utf-8");
-					return crypto.createHash("sha256").update(header).update(buf).digest("hex");
-				} catch {
-					return undefined;
-				}
-			})();
-			if (actualId === undefined) {
-				mismatches.push(`${relPath}: missing or unreadable`);
-				this.deleteStatCacheEntry(relPath);
-				if (mismatches.length >= 50) break;
-				continue;
-			}
-			if (actualId !== entry.objectId) mismatches.push(`${relPath}: content mismatch`);
-			// Fingerprint AFTER the read so the cached stat can never predate the bytes.
-			this.refreshStatCacheFromHost(relPath, actualId);
-			if (mismatches.length >= 50) break;
+			const mismatch = this.verifyOneHostPath(relPath, tree[relPath], strictPaths);
+			if (mismatch) mismatches.push(mismatch);
+			if (mismatches.length >= MAX_HOST_MISMATCHES) break;
 		}
 		this.persistStatCache();
 		return { matches: mismatches.length === 0, mismatches, checked };
 	}
 
-	/** Verify that the host working tree still matches a published LayerFS layer. */
+	/**
+	 * Verify ONE host path against its expected tree entry.
+	 *
+	 * Returns the mismatch message (`undefined` when the host matches) instead of pushing it
+	 * into a shared list, so `verifyHostMatchesTree` owns the single reporting cap. All
+	 * stat-cache side effects of a per-path check stay in here.
+	 */
+	private verifyOneHostPath(
+		relPath: string,
+		entry: TreeEntry | undefined,
+		strictPaths: boolean,
+	): string | undefined {
+		const full = this.safeHostPath(relPath);
+
+		if (!entry) {
+			let present = true;
+			try {
+				fs.lstatSync(full, { bigint: true });
+			} catch (err) {
+				const code = (err as NodeJS.ErrnoException)?.code;
+				present = !(code === "ENOENT" || code === "ENOTDIR");
+			}
+			if (present) return `${relPath}: expected deleted file to be absent`;
+			this.deleteStatCacheEntry(relPath);
+			return undefined;
+		}
+
+		const stat = (() => {
+			try {
+				return fs.lstatSync(full, { bigint: true });
+			} catch {
+				return undefined;
+			}
+		})();
+		if (!stat) {
+			this.deleteStatCacheEntry(relPath);
+			return `${relPath}: missing or unreadable`;
+		}
+
+		if (entry.type === "symlink") {
+			let ok = false;
+			try {
+				ok = stat.isSymbolicLink() && fs.readlinkSync(full) === entry.symlinkTarget;
+			} catch {
+				ok = false;
+			}
+			if (!ok) {
+				this.deleteStatCacheEntry(relPath);
+				return `${relPath}: symlink mismatch`;
+			}
+			this.updateStatCache(relPath, stat, entry.objectId);
+			return undefined;
+		}
+
+		if (!stat.isFile()) {
+			this.deleteStatCacheEntry(relPath);
+			return `${relPath}: not a regular file`;
+		}
+
+		if (!strictPaths) {
+			const cached = this.statCacheHit(relPath, stat);
+			if (cached && this.hasCanonicalBlob(cached.objectId)) {
+				if (cached.objectId !== entry.objectId) return `${relPath}: content mismatch`;
+				return undefined;
+			}
+		}
+
+		const actualId = (() => {
+			try {
+				const buf = fs.readFileSync(full);
+				const header = Buffer.from(`blob ${buf.byteLength}\0`, "utf-8");
+				return crypto.createHash("sha256").update(header).update(buf).digest("hex");
+			} catch {
+				return undefined;
+			}
+		})();
+		if (actualId === undefined) {
+			this.deleteStatCacheEntry(relPath);
+			return `${relPath}: missing or unreadable`;
+		}
+		// Fingerprint AFTER the read so the cached stat can never predate the bytes.
+		this.refreshStatCacheFromHost(relPath, actualId);
+		if (actualId !== entry.objectId) return `${relPath}: content mismatch`;
+		return undefined;
+	}
+
 	public verifyHostMatchesLayer(layerId?: string): {
 		matches: boolean;
 		mismatches: string[];
@@ -1682,7 +1590,6 @@ export class LayerFSEngine {
 				};
 			}
 		}
-		// The restored head must be a real layer that still exists in the store.
 		try {
 			this.loadLayer(targetParentLayerId);
 		} catch {
@@ -1759,7 +1666,6 @@ export class LayerFSEngine {
 
 	private readTextSafe(objectId: string): string {
 		const buf = this.readCanonicalBlob(objectId);
-		// Check for null bytes (binary file)
 		if (buf.includes(0)) {
 			return `[Binary file: ${buf.byteLength} bytes, ObjectId=${objectId.slice(0, 12)}]`;
 		}
@@ -1767,9 +1673,6 @@ export class LayerFSEngine {
 	}
 }
 
-/**
- * Generates a readable unified diff for a single file.
- */
 function createUnifiedFileDiff(
 	relPath: string,
 	oldText: string,
@@ -1797,7 +1700,6 @@ function createUnifiedFileDiff(
 		};
 	}
 
-	// Myers/LCS line diff with context lines
 	const edits = computeLineDiff(oldLines, newLines);
 	let added = 0;
 	let removed = 0;
@@ -1874,7 +1776,6 @@ interface LineEdit {
 }
 
 function computeLineDiff(oldLines: string[], newLines: string[]): LineEdit[] {
-	// Trim common prefix and suffix for speed on large files
 	let start = 0;
 	while (
 		start < oldLines.length &&
@@ -1907,7 +1808,6 @@ function computeLineDiff(oldLines: string[], newLines: string[]): LineEdit[] {
 		return [...prefix, ...midOld.map((line): LineEdit => ({ type: "del", line })), ...suffix];
 	}
 
-	// If middle section is huge (>1500 lines), fall back to block replacement
 	if (midOld.length * midNew.length > 2_250_000) {
 		return [
 			...prefix,
@@ -2011,22 +1911,11 @@ function resolveMergedMode(
 	if (entries.length === 0) return baseEntry?.mode ?? 0o100644;
 
 	if (baseEntry && entries.some((entry) => entry.mode !== baseEntry.mode)) {
-		// Some contributor changed the mode: prefer the executable mode when present
-		// (an executable bit is safe to converge on), else take the first change.
+		// An executable bit is safe to converge on.
 		const executable = entries.find((entry) => entry.mode === 0o755);
 		return executable ? executable.mode : entries[0].mode;
 	}
 	return entries[0].mode;
-}
-
-/** `firstEntry` with the merged mode applied (returns the same object when unchanged). */
-function withMergedMode(
-	baseEntry: TreeEntry | undefined,
-	firstEntry: TreeEntry,
-	touches: Array<{ entry: TreeEntry | undefined }>,
-): TreeEntry {
-	const mode = resolveMergedMode(baseEntry, touches);
-	return mode === firstEntry.mode ? firstEntry : { ...firstEntry, mode };
 }
 
 /**
@@ -2074,7 +1963,6 @@ function multiWayMergeText(
 		}
 		const prev = mergedHunks[mergedHunks.length - 1];
 
-		// Convergent identical hunk across branches: keep a single copy.
 		const identical =
 			curr.baseStart === prev.baseStart &&
 			curr.baseEnd === prev.baseEnd &&
@@ -2119,15 +2007,4 @@ function multiWayMergeText(
 	}
 
 	return { ok: true, mergedText: out.join("\n") };
-}
-
-/**
- * Deterministic 3-way text merge for disjoint hunks relative to `baseText`.
- */
-function threeWayMergeText(
-	baseText: string,
-	oursText: string,
-	theirsText: string,
-): { ok: boolean; mergedText: string; conflictPreview?: string } {
-	return multiWayMergeText(baseText, [oursText, theirsText]);
 }
