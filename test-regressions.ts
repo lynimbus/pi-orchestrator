@@ -1,6 +1,7 @@
 /**
- * Regression tests for the failures documented in docs/orchestrator-issues.md
- * plus extra latent issues found while auditing the extension.
+ * Regression tests for the integration data-loss, crash-recovery and workspace-isolation
+ * failures the guards in `integration-state.ts` / `layerfs-engine.ts` / `verifier.ts` are
+ * built around, plus extra latent issues found while auditing the extension.
  *
  * Run with: node ./test-regressions.ts
  */
@@ -134,7 +135,7 @@ function cleanup() {
 	}
 }
 
-/** P1: initial import must include untracked files; warn when a host import drops files. */
+/** Initial import must include untracked files; warn when a host import drops files. */
 function testUntrackedImportAndRegressionWarning() {
 	const host = makeHost({
 		"tracked.txt": "tracked\n",
@@ -161,7 +162,7 @@ function testUntrackedImportAndRegressionWarning() {
 	);
 }
 
-/** P0: duplicate integrate must be refused and must not touch the host working tree. */
+/** Duplicate integrate must be refused and must not touch the host working tree. */
 function testDuplicateIntegrateIsRefused() {
 	const host = makeHost({ "shared.txt": "base\n", "keep.txt": "keep\n" });
 	const engine = new LayerFSEngine(host, nextProjectId());
@@ -333,7 +334,7 @@ function testExecutableModePropagation() {
 	assert.notEqual(mode & 0o111, 0, "executable bit must be applied to the host file");
 }
 
-/** P1/P2/P3: scratch dirs, full diagnostics, stray artifact cleanup, abort, timeout. */
+/** Scratch dirs, full diagnostics, stray artifact cleanup, abort, timeout. */
 async function testWorkspaceCommandDiagnostics() {
 	const host = makeHost({ "app.txt": "app\n" });
 	hosts.push(host);
@@ -1144,7 +1145,7 @@ async function testCommandRunnerAndDecisionBehavior() {
 async function runTests() {
 	const tests: Array<[string, () => void | Promise<void>]> = [
 		["untracked files imported + regression warning", testUntrackedImportAndRegressionWarning],
-		["duplicate integrate refused, host unchanged (P0)", testDuplicateIntegrateIsRefused],
+		["duplicate integrate refused, host unchanged", testDuplicateIntegrateIsRefused],
 		["cross-branch additions + explicit deletion", testCrossBranchAdditionsAndExplicitDeletion],
 		["host snapshot / verification / rollback / re-merge", testSnapshotVerifyAndRollback],
 		["executable mode propagation", testExecutableModePropagation],

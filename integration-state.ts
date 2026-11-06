@@ -1,8 +1,8 @@
 /**
  * Pure integration state-machine decisions.
  *
- * Kept free of Pi/LayerFS side effects so the P0 data-loss guard (a wave must
- * never be merged twice) can be covered by deterministic unit tests.
+ * Kept free of Pi/LayerFS side effects so the data-loss guard (a wave must never
+ * be merged twice) can be covered by deterministic unit tests.
  */
 
 import type { OrchestrationPlan, TaskStatus } from "./types.ts";

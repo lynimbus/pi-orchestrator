@@ -1100,8 +1100,8 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			const plan = activePlan!;
 			const storeHead = engine.getHeadLayerId();
 
-			// P0: never merge the same wave twice. The LayerFS head has already advanced
-			// past the branches' fork base; re-merging would publish a rollback Layer.
+			// Never merge the same wave twice: the LayerFS head has already advanced past
+			// the branches' fork base, so re-merging would publish a rollback Layer.
 			const decision = decideIntegrationAction(plan, storeHead);
 			if (decision.action !== "merge") {
 				const existing = plan.integration;

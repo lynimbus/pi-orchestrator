@@ -1075,9 +1075,9 @@ export class LayerFSEngine {
 		}
 
 		// Guard against silent data loss: every path that disappears from the parent
-		// tree must have been explicitly deleted by a branch. This catches stale-branch
-		// replays and any layer that would shrink the tree without a reason (the L4
-		// rollback layer described in docs/orchestrator-issues.md).
+		// tree must have been explicitly deleted by a branch. Stale-branch replays (a
+		// wave merged again after its Layer was published) and any layer that would
+		// otherwise shrink the tree are refused here.
 		const unexplainedDeletions = Object.keys(baseLayer.tree).filter(
 			(relPath) => !(relPath in mergedTree) && !explicitDeletions.has(relPath),
 		);

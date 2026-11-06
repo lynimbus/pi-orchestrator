@@ -39,14 +39,13 @@ const lines: string[] = readme.split(/\r?\n/);
 
 interface TestCase {
 	name: string;
-	acceptance: string;
 	run: () => void;
 }
 
 const tests: TestCase[] = [];
 
-function test(name: string, acceptance: string, run: () => void): void {
-	tests.push({ name, acceptance, run });
+function test(name: string, run: () => void): void {
+	tests.push({ name, run });
 }
 
 function expectIncludes(haystack: string, needle: string, label: string): void {
@@ -90,7 +89,6 @@ const RESTART_CONTEXT_KEYWORDS = ["重启", "/reload"];
 
 test(
 	"首行标题为 `# Pi Orchestrator` 且不含旧本地路径",
-	"验收 1",
 	() => {
 		const first = (lines[0] ?? "").trimEnd();
 		if (!first.startsWith("# Pi Orchestrator")) {
@@ -103,7 +101,6 @@ test(
 
 test(
 	"包含云端安装命令 `pi install git:github.com/lynimbus/pi-orchestrator`",
-	"验收 2 / 用例 2",
 	() => {
 		expectIncludes(readme, `pi install ${GIT_PACKAGE}`, "安装命令");
 	},
@@ -111,7 +108,6 @@ test(
 
 test(
 	"安装节给出 SSH 备选命令与 settings.json packages 说明",
-	"验收 2 / 用例 3",
 	() => {
 		expectIncludes(readme, "pi install git:git@github.com:lynimbus/pi-orchestrator", "SSH 备选安装命令");
 		const install = getSection("安装");
@@ -125,7 +121,6 @@ test(
 
 test(
 	"包含更新命令 `pi update git:...` 与 `pi update --extensions`",
-	"验收 3 / 用例 4",
 	() => {
 		expectIncludes(readme, `pi update ${GIT_PACKAGE}`, "更新命令");
 		expectIncludes(readme, "pi update --extensions", "全量更新命令");
@@ -141,7 +136,6 @@ test(
 
 test(
 	"更新节说明 git 包按仓库 URL 标识且 `@<ref>` 固定版本不被移动",
-	"验收 3",
 	() => {
 		const update = getSection("更新");
 		expectIncludes(update, "@<ref>", "`## 更新` 小节固定版本语法");
@@ -152,7 +146,6 @@ test(
 
 test(
 	"同时包含 `## 安装` `## 更新` `## 从本地目录副本迁移` `## 本地开发` 四个小节",
-	"验收 2-5 / 用例 5",
 	() => {
 		for (const title of ["## 安装", "## 更新", "## 从本地目录副本迁移", "## 本地开发"]) {
 			expectIncludes(readme, title, "小节标题");
@@ -167,7 +160,6 @@ test(
 
 test(
 	"迁移节包含备份/移除/校验/回滚命令且禁止本地拷贝与 git 包共存",
-	"验收 4 / 用例 6",
 	() => {
 		const migrate = getSection("从本地目录副本迁移");
 		expectIncludes(migrate, "mkdir -p ~/.pi/agent/extensions/.backup", "`## 从本地目录副本迁移` 备份目录");
@@ -191,7 +183,6 @@ test(
 
 test(
 	"迁移节的共存风险是可验证的谨慎表述，不把运行时行为写成必然断言",
-	"重试反馈 1 / 验收 4",
 	() => {
 		const migrate = getSection("从本地目录副本迁移");
 		// 必须写明包身份去重的三类标识，以及本地副本与 git 包是两条不同来源
@@ -217,7 +208,6 @@ test(
 
 test(
 	"`## 本地开发` 与 `## 测试` 的 npm test 注释同步为六段链",
-	"重试反馈 2 / 验收 5",
 	() => {
 		const sixStage = SIX_STAGE_CHAIN;
 		expectIncludes(getSection("本地开发"), sixStage, "`## 本地开发` npm test 六段链注释");
@@ -241,7 +231,6 @@ test(
 
 test(
 	"README 的 npm test 链与 suite-contract.ts 的 TEST_SUITE_COMMANDS 逐段一致（六段）",
-	"验收 1 / 用例 1",
 	() => {
 		if (TEST_SUITE_COMMANDS.length !== 6) {
 			throw new Error(
@@ -257,7 +246,6 @@ test(
 
 test(
 	"`## 测试` 列出 node ./test-primitives.ts 的单独运行命令并写进覆盖说明",
-	"验收 1 / 用例 1",
 	() => {
 		const testing = getSection("测试");
 		expectIncludes(testing, "- `node ./test-primitives.ts`", "`## 测试` 原语测试条目");
@@ -270,7 +258,6 @@ test(
 
 test(
 	"README 只声称六段链，不再出现五段链表述",
-	"验收 1",
 	() => {
 		expectIncludes(readme, "六段链", "README 段数表述");
 		expectNotIncludes(readme, "五段链", "README 陈旧段数表述");
@@ -280,7 +267,6 @@ test(
 
 test(
 	"SKILL.md 不引用已删除的 withMergedMode / threeWayMergeText 并解释语义锚点",
-	"验收 3 / 用例 2",
 	() => {
 		const skill = readRepoFile(".agents/skills/verify-wave-integration/SKILL.md");
 		expectNotIncludes(skill, "withMergedMode", "SKILL.md 已删除的 withMergedMode 包装");
@@ -300,7 +286,6 @@ test(
 
 test(
 	"verify-wave-integration.ts 的 codeRef 全部是函数名锚点，不含行号范围",
-	"验收 4 / 用例 2",
 	() => {
 		const script = readRepoFile(
 			path.join(".agents", "skills", "verify-wave-integration", "scripts", "verify-wave-integration.ts"),
@@ -333,49 +318,7 @@ test(
 );
 
 test(
-	"docs/ablation-report.md 具备六段结构与精确基线指标",
-	"验收 5 / 用例 4",
-	() => {
-		const report = readRepoFile("docs/ablation-report.md");
-		for (const heading of [
-			"## 目标与方法",
-			"## 基线指标",
-			"## 问题清单与修复决策",
-			"## 消融记录",
-			"## 保留的特殊情况",
-			"## 结论与复测命令",
-			"## 最终指标（由 Lead 在最后一波后填写）",
-		]) {
-			expectIncludes(report, heading, `docs/ablation-report.md 结构：${heading}`);
-		}
-		for (const number of [
-			"5899",
-			"3066",
-			"3/3",
-			"1422",
-			"threeWayMergeText",
-			"withMergedMode",
-			"StatusDiagnostics",
-			"mismatches.length >= 50",
-			"2000ms",
-			"3000ms",
-			"16",
-		]) {
-			expectIncludes(report, number, `docs/ablation-report.md 基线指标：${number}`);
-		}
-		expectIncludes(report, "5826", "docs/ablation-report.md 最终规模（追加波 1 / 2 后）：生产代码 5826 行");
-		for (const fix of ["F1", "F2", "F3", "F4", "F5", "F6", "F7"]) {
-			expectIncludes(report, `### ${fix} `, `docs/ablation-report.md 决策日志：${fix}`);
-		}
-		for (const wave of ["Wave 1", "Wave 2", "Wave 3"]) {
-			expectIncludes(report, wave, `docs/ablation-report.md 消融记录：${wave}`);
-		}
-	},
-);
-
-test(
 	"`## 测试` 小节列出 test-packaging-manifest.ts 与 test-packaging-docs.ts 的单独运行命令",
-	"重试反馈 2 / 验收 5",
 	() => {
 		const testing = getSection("测试");
 		expectIncludes(testing, "node ./test-packaging-manifest.ts", "`## 测试` 包清单测试入口");
@@ -386,7 +329,6 @@ test(
 
 test(
 	"本地开发节包含 clone / npm test / `pi install ./` / 技能路径",
-	"验收 5 / 用例 7",
 	() => {
 		const dev = getSection("本地开发");
 		expectIncludes(dev, "git clone https://github.com/lynimbus/pi-orchestrator", "`## 本地开发` 克隆仓库");
@@ -405,7 +347,6 @@ test(
 
 test(
 	"既有功能文档仍完整保留（/orch 系列、Ctrl+Alt+O、--orch 参数、orchestrator.json、LayerFS、机械门禁等）",
-	"验收 6 / 用例 8",
 	() => {
 		const anchors = [
 			"/orch model",
@@ -442,7 +383,6 @@ test(
 
 test(
 	"含旧本地路径的每一行都处于迁移/备份/回滚语境",
-	"验收 7 / 用例 9",
 	() => {
 		const allowed = ["rm -rf", ".backup", "迁移", "备份", "回滚", "legacy"];
 		const offenders: string[] = [];
@@ -467,7 +407,6 @@ test(
 
 test(
 	"安装/更新后需重启 Pi 或 `/reload` 生效的说明存在",
-	"验收 3 / 用例 10",
 	() => {
 		expectIncludes(readme, "/reload", "重启生效说明");
 		const reloadLines = lines.filter((line) => line.includes("/reload"));
@@ -495,7 +434,6 @@ test(
 
 test(
 	"README 不再把手抄本地目录当作安装位置指引",
-	"验收 1 / 7",
 	() => {
 		expectNotIncludes(readme, "拷贝到 ~/.pi/agent/extensions", "安装叙事");
 		expectNotIncludes(readme, "安装到 ~/.pi/agent/extensions/orchestrator", "安装叙事");
@@ -513,7 +451,6 @@ test(
 
 test(
 	"文档声明的仓库地址与包标识保持一致",
-	"验收 2 / 3",
 	() => {
 		expectIncludes(readme, "https://github.com/lynimbus/pi-orchestrator", "仓库地址");
 		expectIncludes(readme, GIT_PACKAGE, "git 包标识");

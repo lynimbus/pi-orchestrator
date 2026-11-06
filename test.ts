@@ -457,12 +457,12 @@ async function testSingleFileHostDriftMessages() {
 }
 
 /**
- * Ablation oracle for deleting `threeWayMergeText`: three branches editing three DIFFERENT
- * lines of one base file must still merge into a host file containing all three edits.
+ * Three branches editing three DIFFERENT lines of one base file must still merge into a
+ * host file containing all three edits.
  */
 async function testThreeBranchDisjointLineMergePublishesAllEdits() {
 	const baseText = "line-1\nline-2\nline-3\nline-4\nline-5\n";
-	const sandbox = await buildLineMergeWave("t3-three-way-ablation", "shared.txt", baseText, {
+	const sandbox = await buildLineMergeWave("t3-three-way-line-merge", "shared.txt", baseText, {
 		"task-a": "LINE-1\nline-2\nline-3\nline-4\nline-5\n",
 		"task-b": "line-1\nline-2\nLINE-3\nline-4\nline-5\n",
 		"task-c": "line-1\nline-2\nline-3\nline-4\nLINE-5\n",
@@ -470,7 +470,7 @@ async function testThreeBranchDisjointLineMergePublishesAllEdits() {
 	try {
 		const result = sandbox.engine.mergeAndPublishWave(["task-a", "task-b", "task-c"], {
 			allowAutoThreeWayLineMerge: true,
-			message: "three-way ablation merge",
+			message: "three-way line merge",
 		});
 		assert.equal(
 			result.ok,

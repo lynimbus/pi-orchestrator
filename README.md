@@ -129,7 +129,7 @@ pi --orch --orch-model group/deepseek --orch-thinking medium
 
 ## 集成（每个 wave 只调用一次 `orch_integrate`）
 
-> 历史事故：集成测试失败后重试 `orch_integrate`，插件发布了「回退层」并静默抹掉整个 wave 的改动。详见 [`docs/orchestrator-issues.md`](docs/orchestrator-issues.md)。
+> 只允许一次的原因：分支的 fork base 是集成前的旧 head，重放它们的完整树会把本波新增的文件当成「删除」，发布出一个「回退层」并静默抹掉宿主上的改动。集成失败要重跑测试用 `orch_retry_integration`，要放弃本轮改动用 `orch_rollback_integration`。
 
 | 工具 | 作用 |
 | --- | --- |
