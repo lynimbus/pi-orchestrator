@@ -14,6 +14,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { TEST_SUITE_COMMANDS } from "./suite-contract.ts";
+import { ORCHESTRATOR_TOOL_NAMES } from "./tool-gate.ts";
 import { createSyncTestRunner } from "./test-kit.ts";
 
 const runner = createSyncTestRunner();
@@ -22,10 +23,10 @@ const HERE = import.meta.dirname ?? path.dirname(fileURLToPath(import.meta.url))
 const README_PATH = path.join(HERE, "README.md");
 
 /** The exact `&&`-chained command line that `npm test` must document. */
-const SEVEN_STAGE_CHAIN = TEST_SUITE_COMMANDS.join(" && ");
+const ELEVEN_STAGE_CHAIN = TEST_SUITE_COMMANDS.join(" && ");
 
 /** Stage-count claim the README must make (and the count `TEST_SUITE_COMMANDS` must have). */
-const STAGE_COUNT = 7;
+const STAGE_COUNT = 11;
 
 const LEGACY_PATH = "~/.pi/agent/extensions/orchestrator";
 const GIT_PACKAGE = "git:github.com/lynimbus/pi-orchestrator";
@@ -210,11 +211,11 @@ test(
 );
 
 test(
-	"`## 本地开发` 与 `## 测试` 的 npm test 注释同步为七段链",
+	"`## 本地开发` 与 `## 测试` 的 npm test 注释同步为十一段链",
 	() => {
-		const sevenStage = SEVEN_STAGE_CHAIN;
-		expectIncludes(getSection("本地开发"), sevenStage, "`## 本地开发` npm test 七段链注释");
-		expectIncludes(getSection("测试"), sevenStage, "`## 测试` npm test 七段链注释");
+		const elevenStage = ELEVEN_STAGE_CHAIN;
+		expectIncludes(getSection("本地开发"), elevenStage, "`## 本地开发` npm test 十一段链注释");
+		expectIncludes(getSection("测试"), elevenStage, "`## 测试` npm test 十一段链注释");
 		// 源码中不存在只写三段的 npm test 注释
 		const commented = lines.filter((line) => /npm test\s+#/.test(line));
 		if (commented.length === 0) {
@@ -224,7 +225,7 @@ test(
 			for (const stage of TEST_SUITE_COMMANDS) {
 				if (!line.includes(stage)) {
 					throw new Error(
-						`npm test 注释：期望行内包含 \`${stage}\`（七段链完整），实际缺失。违规行：${line.trim()}`,
+						`npm test 注释：期望行内包含 \`${stage}\`（十一段链完整），实际缺失。违规行：${line.trim()}`,
 					);
 				}
 			}
@@ -233,17 +234,17 @@ test(
 );
 
 test(
-	"README 的 npm test 链与 suite-contract.ts 的 TEST_SUITE_COMMANDS 逐段一致（七段）",
+	"README 的 npm test 链与 suite-contract.ts 的 TEST_SUITE_COMMANDS 逐段一致（十一段）",
 	() => {
 		if (TEST_SUITE_COMMANDS.length !== STAGE_COUNT) {
 			throw new Error(
 				`TEST_SUITE_COMMANDS：期望 ${STAGE_COUNT} 段，实际 ${TEST_SUITE_COMMANDS.length} 段（${TEST_SUITE_COMMANDS.join(" && ")}）`,
 			);
 		}
-		expectIncludes(SEVEN_STAGE_CHAIN, "node ./test-worker-session.ts", "七段链中的 worker session 测试");
-		expectIncludes(SEVEN_STAGE_CHAIN, "node ./test-primitives.ts", "七段链最后一段");
+		expectIncludes(ELEVEN_STAGE_CHAIN, "node ./test-worker-session.ts", "十一段链中的 worker session 测试");
+		expectIncludes(ELEVEN_STAGE_CHAIN, "node ./test-primitives.ts", "十一段链最后一段");
 		for (const title of ["本地开发", "测试"]) {
-			expectIncludes(getSection(title), SEVEN_STAGE_CHAIN, `\`## ${title}\` 七段链与单源顺序一致`);
+			expectIncludes(getSection(title), ELEVEN_STAGE_CHAIN, `\`## ${title}\` 十一段链与单源顺序一致`);
 		}
 	},
 );
@@ -261,12 +262,165 @@ test(
 );
 
 test(
-	"README 只声称七段链，不再出现六段链 / 五段链表述",
+	"README 只声称十一段链，不再出现七段链 / 六段链 / 五段链表述",
 	() => {
-		expectIncludes(readme, "七段链", "README 段数表述");
+		expectIncludes(readme, "十一段链", "README 段数表述");
+		expectNotIncludes(readme, "七段链", "README 陈旧段数表述");
 		expectNotIncludes(readme, "六段链", "README 陈旧段数表述");
 		expectNotIncludes(readme, "五段链", "README 陈旧段数表述");
 		expectNotIncludes(readme, "四段链", "README 陈旧段数表述");
+	},
+);
+
+/**
+ * The four suites registered by the three policy modules. Kept as an explicit list
+ * (not sliced out of TEST_SUITE_COMMANDS) so a contract that merely drops a stage
+ * cannot also drop its own inclusion assertion.
+ */
+const POLICY_SUITES = [
+	"test-thinking-levels.ts",
+	"test-tool-gate.ts",
+	"test-session-config.ts",
+	"test-extension-wiring.ts",
+];
+
+test(
+	"十一段链包含四个新策略套件，且顺序与索引 5-8 一致",
+	() => {
+		for (const [offset, suite] of POLICY_SUITES.entries()) {
+			const stage = `node ./${suite}`;
+			expectIncludes(ELEVEN_STAGE_CHAIN, stage, `十一段链中的 ${suite}`);
+			expectIncludes(readme, stage, "README 中的 " + suite + " 命令");
+			const index = TEST_SUITE_COMMANDS.indexOf(stage);
+			if (index !== 5 + offset) {
+				throw new Error(
+					`${suite}：期望位于索引 ${5 + offset}，实际位于索引 ${index}（${TEST_SUITE_COMMANDS.join(" && ")}）`,
+				);
+			}
+		}
+	},
+);
+
+test(
+	"`## 测试` 为四个新策略套件各列一条单独运行命令与覆盖说明",
+	() => {
+		const testing = getSection("测试");
+		for (const suite of POLICY_SUITES) {
+			expectIncludes(testing, `- \`node ./${suite}\``, `\`## 测试\` ${suite} 条目`);
+		}
+		expectIncludes(testing, "test-thinking-levels.ts` 覆盖", "覆盖说明中的思考等级策略测试");
+		expectIncludes(testing, "test-tool-gate.ts` 覆盖", "覆盖说明中的工具闸门测试");
+		expectIncludes(testing, "test-session-config.ts` 覆盖", "覆盖说明中的会话配置测试");
+		expectIncludes(testing, "test-extension-wiring.ts` 覆盖", "覆盖说明中的接线测试");
+		for (const module of ["thinking-levels.ts", "tool-gate.ts", "session-config.ts"]) {
+			expectIncludes(testing, `\`${module}\``, `覆盖说明列出 ${module}`);
+		}
+	},
+);
+
+test(
+	"`/orch thinking` 不再宣传固定枚举，改为跟随所选子代理模型的声明",
+	() => {
+		expectNotIncludes(readme, "[off|minimal|low|medium|high|xhigh|inherit]", "固定思考等级枚举");
+		expectIncludes(readme, "/orch thinking", "`/orch thinking` 命令文档");
+		const usage = getSection("快速上手");
+		expectIncludes(usage, "reasoning", "思考等级来自模型的 reasoning 声明");
+		expectIncludes(usage, "thinkingLevelMap", "思考等级来自模型的 thinkingLevelMap");
+		expectIncludes(usage, "magpie/group/deepseek", "deepseek 模型声明示例");
+		expectIncludes(usage, "off / low / high / max", "deepseek 声明的具体等级");
+		expectIncludes(usage, "magpie/group/hy4", "hy4 模型声明示例");
+		expectIncludes(usage, "只声明 \`high\`", "hy4 只声明 high");
+		expectIncludes(usage, "不做过滤", "无法解析声明时不过滤等级");
+		expectIncludes(usage, "丢弃", "不被声明的配置等级会被丢弃");
+		expectIncludes(usage, "clamping", "被丢弃的等级交给 pi 自己的 clamping");
+	},
+);
+
+test(
+	"README 说明关闭状态下八个 orch 工具既不声明给模型也不可调用",
+	() => {
+		const usage = getSection("快速上手");
+		expectIncludes(usage, "既不声明", "工具声明移除说明");
+		expectIncludes(usage, "无法调用", "不可调用说明");
+		expectIncludes(usage, "system prompt", "工具指南一并移除说明");
+		expectIncludes(usage, "/orch on", "拦截理由指向 `/orch on`");
+		for (const tool of ORCHESTRATOR_TOOL_NAMES) {
+			expectIncludes(usage, tool, `关闭时不可用的工具 ${tool}`);
+		}
+	},
+);
+
+test(
+	"快速上手的 `--orch` 示例使用真实的 provider/modelId 与模型声明过的等级",
+	() => {
+		const usage = getSection("快速上手");
+		expectIncludes(usage, "`--orch-model` 接受 `provider/modelId`", "`--orch-model` 的 provider/modelId 说明");
+
+		// 文档自己写出的「<模型> 声明 `<等级>`」句子，就是示例必须遵守的声明表。
+		const declarations = new Map<string, string[]>();
+		for (const match of usage.matchAll(/`([a-z0-9]+\/[a-z0-9/._-]+)` 只?声明 `([^`]+)`/g)) {
+			declarations.set(
+				match[1],
+				match[2]
+					.split("/")
+					.map((level) => level.trim())
+					.filter(Boolean),
+			);
+		}
+		if (declarations.size < 2) {
+			throw new Error(
+				`模型声明示例：期望 \`## 快速上手\` 至少写出两个模型的声明等级，实际 ${declarations.size} 个（${[...declarations.keys()].join(", ")}）`,
+			);
+		}
+
+		const examples = lines.filter((line) => line.trim().startsWith("pi --orch"));
+		if (examples.length === 0) {
+			throw new Error("CLI 示例：期望至少存在一条以 `pi --orch` 开头的示例命令，实际缺失");
+		}
+		for (const line of examples) {
+			const model = /--orch-model\s+(\S+)/.exec(line)?.[1];
+			if (model === undefined) {
+				throw new Error(`CLI 示例：期望示例命令带 \`--orch-model provider/modelId\`，实际：${line.trim()}`);
+			}
+			if (!/^[a-z0-9]+\/[a-z0-9/._-]+$/.test(model)) {
+				throw new Error(
+					`CLI 示例：\`--orch-model ${model}\` 不是 provider/modelId 形式（按第一个 \`/\` 切分），实际：${line.trim()}`,
+				);
+			}
+			const declared = declarations.get(model);
+			if (declared === undefined) {
+				throw new Error(
+					`CLI 示例：\`${model}\` 的等级声明未在 \`## 快速上手\` 写出，读者无法判断该示例是否可用（已声明等级的模型：${[...declarations.keys()].join(", ")}）。实际：${line.trim()}`,
+				);
+			}
+			const level = /--orch-thinking\s+(\S+)/.exec(line)?.[1];
+			if (level === undefined || level === "inherit") continue;
+			if (!declared.includes(level)) {
+				throw new Error(
+					`CLI 示例：\`${model}\` 未声明 \`${level}\`（已声明 ${declared.join(" / ")}），该等级会在派工时被丢弃。实际：${line.trim()}`,
+				);
+			}
+		}
+	},
+);
+
+test(
+	"README 把手动开关状态改为按会话存储，orchestrator.json 降级为可选默认种子",
+	() => {
+		expectNotIncludes(readme, "配置文件持久化保存在", "全局持久化声明");
+		const usage = getSection("快速上手");
+		expectIncludes(usage, "orchestrator-state", "按会话存储的 `orchestrator-state` 条目");
+		expectIncludes(usage, "会话", "实时状态属于会话自身");
+		expectIncludes(usage, "~/.pi/agent/orchestrator.json", "默认种子文件路径");
+		expectIncludes(usage, "默认种子", "默认种子文件的降级定位");
+		expectIncludes(usage, "永远不会写", "扩展从不写默认种子文件");
+		expectIncludes(usage, "`enabled`", "`enabled` 字段说明");
+		expectIncludes(usage, "忽略", "`enabled` 字段被忽略");
+		expectIncludes(usage, "--orch", "`--orch` 仍然只在当次会话强制开启");
+		expectIncludes(usage, "内置默认值", "优先级最低层：内置默认值");
+		expectIncludes(usage, "默认种子文件", "优先级：默认种子文件");
+		expectIncludes(usage, "会话条目", "优先级：会话条目");
+		expectIncludes(usage, "CLI 参数", "优先级最高层：CLI 参数");
 	},
 );
 
@@ -340,8 +494,8 @@ test(
 		const dev = getSection("本地开发");
 		expectIncludes(dev, "git clone https://github.com/lynimbus/pi-orchestrator", "`## 本地开发` 克隆仓库");
 		expectIncludes(dev, "npm test", "`## 本地开发` 测试命令");
-		expectIncludes(dev, "test-packaging-manifest.ts", "`## 本地开发` npm test 七段链中的包清单测试");
-		expectIncludes(dev, "test-packaging-docs.ts", "`## 本地开发` npm test 七段链中的文档测试");
+		expectIncludes(dev, "test-packaging-manifest.ts", "`## 本地开发` npm test 十一段链中的包清单测试");
+		expectIncludes(dev, "test-packaging-docs.ts", "`## 本地开发` npm test 十一段链中的文档测试");
 		expectIncludes(dev, "pi install ./", "`## 本地开发` 本地安装调试");
 		expectIncludes(dev, "pi -e ./index.ts", "`## 本地开发` 临时加载");
 		expectIncludes(dev, "pi remove ./", "`## 本地开发` 摘掉本地声明");

@@ -26,11 +26,11 @@
  *    `importHostAsLayer` never imports a host `sessions/`, while ordinary files
  *    keep being captured. Without this, worker transcripts would be merged into
  *    every published layer and leak into the host tree.
- * 2. `suite-contract.ts` is the single source for the suite chain: seven stages,
+ * 2. `suite-contract.ts` is the single source for the suite chain: eleven stages,
  *    with `node ./test-worker-session.ts` immediately before `node ./test-primitives.ts`
  *    (the shared-primitive stage stays last).
  * 3. `package.json` `scripts.test` and the README `## 测试` section both follow
- *    that single source, and the README no longer claims the chain is six stages.
+ *    that single source, and the README no longer claims the chain is seven or six stages.
  *
  * Run directly: `node ./test-worker-session.ts`
  */
@@ -477,8 +477,8 @@ const REPO_ROOT = HERE;
 
 /** The stage this very file registers, and where it must sit in the chain. */
 const SESSION_STAGE = "node ./test-worker-session.ts";
-const SESSION_STAGE_INDEX = 5;
-const EXPECTED_STAGE_COUNT = 7;
+const SESSION_STAGE_INDEX = 9;
+const EXPECTED_STAGE_COUNT = 11;
 
 let counter = 0;
 function nextProjectId(): string {
@@ -525,7 +525,7 @@ function readmeSection(title: string): string {
 async function suiteContractTests(): Promise<void> {
 	console.log("suite-contract.ts single source");
 
-	await testCase("TEST_SUITE_COMMANDS is a seven-stage chain", () => {
+	await testCase(`TEST_SUITE_COMMANDS is an ${EXPECTED_STAGE_COUNT}-stage chain`, () => {
 		assert.equal(
 			TEST_SUITE_COMMANDS.length,
 			EXPECTED_STAGE_COUNT,
@@ -533,18 +533,21 @@ async function suiteContractTests(): Promise<void> {
 		);
 	});
 
-	await testCase("the session stage sits at index 5, right before test-primitives", () => {
-		assert.equal(
-			TEST_SUITE_COMMANDS[SESSION_STAGE_INDEX],
-			SESSION_STAGE,
-			`TEST_SUITE_COMMANDS[${SESSION_STAGE_INDEX}]: expect \`${SESSION_STAGE}\`, actual \`${String(TEST_SUITE_COMMANDS[SESSION_STAGE_INDEX])}\``,
-		);
-		assert.equal(
-			TEST_SUITE_COMMANDS[TEST_SUITE_COMMANDS.length - 1],
-			"node ./test-primitives.ts",
-			"test-primitives.ts must stay the LAST stage (shared primitives underpin every other suite)",
-		);
-	});
+	await testCase(
+		`the session stage sits at index ${SESSION_STAGE_INDEX}, right before test-primitives`,
+		() => {
+			assert.equal(
+				TEST_SUITE_COMMANDS[SESSION_STAGE_INDEX],
+				SESSION_STAGE,
+				`TEST_SUITE_COMMANDS[${SESSION_STAGE_INDEX}]: expect \`${SESSION_STAGE}\`, actual \`${String(TEST_SUITE_COMMANDS[SESSION_STAGE_INDEX])}\``,
+			);
+			assert.equal(
+				TEST_SUITE_COMMANDS[TEST_SUITE_COMMANDS.length - 1],
+				"node ./test-primitives.ts",
+				"test-primitives.ts must stay the LAST stage (shared primitives underpin every other suite)",
+			);
+		},
+	);
 
 	await testCase("every stage is a unique `node ./test-*.ts` command", () => {
 		const unique = new Set(TEST_SUITE_COMMANDS);
@@ -569,7 +572,7 @@ async function suiteContractTests(): Promise<void> {
 		);
 	});
 
-	await testCase("package.json scripts.test chains TEST_SUITE_COMMANDS verbatim (seven stages)", () => {
+	await testCase(`package.json scripts.test chains TEST_SUITE_COMMANDS verbatim (${EXPECTED_STAGE_COUNT} stages)`, () => {
 		const pkg = JSON.parse(readRepoFile("package.json")) as {
 			scripts?: Record<string, string>;
 		};
@@ -615,13 +618,21 @@ async function readmeContractTests(): Promise<void> {
 		);
 	});
 
-	await testCase("`## 测试` claims a seven-stage chain and no longer claims six", () => {
+	await testCase("`## 测试` claims an eleven-stage chain and no longer claims seven or six", () => {
 		const testing = readmeSection("测试");
-		assert.ok(testing.includes("七段链"), `\`## 测试\` must say 七段链 (seven-stage chain); section was:\n${testing}`);
+		assert.ok(
+			testing.includes("十一段链"),
+			`\`## 测试\` must say 十一段链 (eleven-stage chain); section was:\n${testing}`,
+		);
+		assert.ok(!testing.includes("七段链"), "`## 测试` must not keep the stale 七段链 (seven-stage) wording");
 		assert.ok(!testing.includes("六段链"), "`## 测试` must not keep the stale 六段链 (six-stage) wording");
 		assert.ok(
+			!readRepoFile("README.md").includes("七段链"),
+			"README.md must not mention 七段链 anywhere: the chain is eleven stages now",
+		);
+		assert.ok(
 			!readRepoFile("README.md").includes("六段链"),
-			"README.md must not mention 六段链 anywhere: the chain is seven stages now",
+			"README.md must not mention 六段链 anywhere: the chain is eleven stages now",
 		);
 	});
 
@@ -630,7 +641,7 @@ async function readmeContractTests(): Promise<void> {
 		for (const title of ["本地开发", "测试"]) {
 			assert.ok(
 				readmeSection(title).includes(expected),
-				`\`## ${title}\` npm test comment must contain the full seven-stage chain: ${expected}`,
+				`\`## ${title}\` npm test comment must contain the full ${EXPECTED_STAGE_COUNT}-stage chain: ${expected}`,
 			);
 		}
 	});
