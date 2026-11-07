@@ -281,11 +281,6 @@ function packageJsonTests(): void {
 			[...TEST_SUITE_COMMANDS],
 			`scripts.test must chain every registered suite in TEST_SUITE_COMMANDS order (actual: ${JSON.stringify(script)})`,
 		);
-		assert.equal(
-			parts.length,
-			6,
-			`scripts.test must chain exactly six suites (actual: ${String(parts.length)})`,
-		);
 		assert.ok(
 			parts.includes("node ./test-primitives.ts"),
 			"scripts.test must run node ./test-primitives.ts",

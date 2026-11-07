@@ -133,13 +133,17 @@ const SHARED_DEPENDENCY_DIRS = new Set([
 
 /** Directories never imported into LayerFS canonical store or workspaces.
  * `.tmp` / `.cache` are NOT repeated here: they are spread from `SCRATCH_DIR_NAMES`,
- * the single source of truth for the scratch-directory convention. */
+ * the single source of truth for the scratch-directory convention.
+ * `sessions` is the per-task worker-session directory (`workspaces/<task>/sessions`)
+ * where subagent transcripts land: the engine owns it, so neither a host import nor a
+ * workspace commit may capture it (otherwise transcripts leak into published layers). */
 const IGNORED_DIRS = new Set([
 	".git",
 	".jj",
 	".hg",
 	".svn",
 	...SCRATCH_DIR_NAMES,
+	"sessions",
 	".layerfs-orch",
 ]);
 

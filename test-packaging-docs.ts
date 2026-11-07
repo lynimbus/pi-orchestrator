@@ -22,7 +22,10 @@ const HERE = import.meta.dirname ?? path.dirname(fileURLToPath(import.meta.url))
 const README_PATH = path.join(HERE, "README.md");
 
 /** The exact `&&`-chained command line that `npm test` must document. */
-const SIX_STAGE_CHAIN = TEST_SUITE_COMMANDS.join(" && ");
+const SEVEN_STAGE_CHAIN = TEST_SUITE_COMMANDS.join(" && ");
+
+/** Stage-count claim the README must make (and the count `TEST_SUITE_COMMANDS` must have). */
+const STAGE_COUNT = 7;
 
 const LEGACY_PATH = "~/.pi/agent/extensions/orchestrator";
 const GIT_PACKAGE = "git:github.com/lynimbus/pi-orchestrator";
@@ -207,11 +210,11 @@ test(
 );
 
 test(
-	"`## 本地开发` 与 `## 测试` 的 npm test 注释同步为六段链",
+	"`## 本地开发` 与 `## 测试` 的 npm test 注释同步为七段链",
 	() => {
-		const sixStage = SIX_STAGE_CHAIN;
-		expectIncludes(getSection("本地开发"), sixStage, "`## 本地开发` npm test 六段链注释");
-		expectIncludes(getSection("测试"), sixStage, "`## 测试` npm test 六段链注释");
+		const sevenStage = SEVEN_STAGE_CHAIN;
+		expectIncludes(getSection("本地开发"), sevenStage, "`## 本地开发` npm test 七段链注释");
+		expectIncludes(getSection("测试"), sevenStage, "`## 测试` npm test 七段链注释");
 		// 源码中不存在只写三段的 npm test 注释
 		const commented = lines.filter((line) => /npm test\s+#/.test(line));
 		if (commented.length === 0) {
@@ -221,7 +224,7 @@ test(
 			for (const stage of TEST_SUITE_COMMANDS) {
 				if (!line.includes(stage)) {
 					throw new Error(
-						`npm test 注释：期望行内包含 \`${stage}\`（六段链完整），实际缺失。违规行：${line.trim()}`,
+						`npm test 注释：期望行内包含 \`${stage}\`（七段链完整），实际缺失。违规行：${line.trim()}`,
 					);
 				}
 			}
@@ -230,16 +233,17 @@ test(
 );
 
 test(
-	"README 的 npm test 链与 suite-contract.ts 的 TEST_SUITE_COMMANDS 逐段一致（六段）",
+	"README 的 npm test 链与 suite-contract.ts 的 TEST_SUITE_COMMANDS 逐段一致（七段）",
 	() => {
-		if (TEST_SUITE_COMMANDS.length !== 6) {
+		if (TEST_SUITE_COMMANDS.length !== STAGE_COUNT) {
 			throw new Error(
-				`TEST_SUITE_COMMANDS：期望 6 段，实际 ${TEST_SUITE_COMMANDS.length} 段（${TEST_SUITE_COMMANDS.join(" && ")}）`,
+				`TEST_SUITE_COMMANDS：期望 ${STAGE_COUNT} 段，实际 ${TEST_SUITE_COMMANDS.length} 段（${TEST_SUITE_COMMANDS.join(" && ")}）`,
 			);
 		}
-		expectIncludes(SIX_STAGE_CHAIN, "node ./test-primitives.ts", "六段链最后一段");
+		expectIncludes(SEVEN_STAGE_CHAIN, "node ./test-worker-session.ts", "七段链中的 worker session 测试");
+		expectIncludes(SEVEN_STAGE_CHAIN, "node ./test-primitives.ts", "七段链最后一段");
 		for (const title of ["本地开发", "测试"]) {
-			expectIncludes(getSection(title), SIX_STAGE_CHAIN, `\`## ${title}\` 六段链与单源顺序一致`);
+			expectIncludes(getSection(title), SEVEN_STAGE_CHAIN, `\`## ${title}\` 七段链与单源顺序一致`);
 		}
 	},
 );
@@ -257,9 +261,10 @@ test(
 );
 
 test(
-	"README 只声称六段链，不再出现五段链表述",
+	"README 只声称七段链，不再出现六段链 / 五段链表述",
 	() => {
-		expectIncludes(readme, "六段链", "README 段数表述");
+		expectIncludes(readme, "七段链", "README 段数表述");
+		expectNotIncludes(readme, "六段链", "README 陈旧段数表述");
 		expectNotIncludes(readme, "五段链", "README 陈旧段数表述");
 		expectNotIncludes(readme, "四段链", "README 陈旧段数表述");
 	},
@@ -318,12 +323,14 @@ test(
 );
 
 test(
-	"`## 测试` 小节列出 test-packaging-manifest.ts 与 test-packaging-docs.ts 的单独运行命令",
+	"`## 测试` 列出 test-packaging-manifest.ts / test-packaging-docs.ts / test-worker-session.ts 的单独运行命令",
 	() => {
 		const testing = getSection("测试");
 		expectIncludes(testing, "node ./test-packaging-manifest.ts", "`## 测试` 包清单测试入口");
 		expectIncludes(testing, "node ./test-packaging-docs.ts", "`## 测试` 文档契约测试入口");
 		expectIncludes(testing, "test-packaging-manifest.ts", "`## 测试` 包清单测试文件名");
+		expectIncludes(testing, "- `node ./test-worker-session.ts`", "`## 测试` worker session 测试条目");
+		expectIncludes(testing, "test-worker-session", "`## 测试` worker session 覆盖说明");
 	},
 );
 
@@ -333,8 +340,8 @@ test(
 		const dev = getSection("本地开发");
 		expectIncludes(dev, "git clone https://github.com/lynimbus/pi-orchestrator", "`## 本地开发` 克隆仓库");
 		expectIncludes(dev, "npm test", "`## 本地开发` 测试命令");
-		expectIncludes(dev, "test-packaging-manifest.ts", "`## 本地开发` npm test 六段链中的包清单测试");
-		expectIncludes(dev, "test-packaging-docs.ts", "`## 本地开发` npm test 六段链中的文档测试");
+		expectIncludes(dev, "test-packaging-manifest.ts", "`## 本地开发` npm test 七段链中的包清单测试");
+		expectIncludes(dev, "test-packaging-docs.ts", "`## 本地开发` npm test 七段链中的文档测试");
 		expectIncludes(dev, "pi install ./", "`## 本地开发` 本地安装调试");
 		expectIncludes(dev, "pi -e ./index.ts", "`## 本地开发` 临时加载");
 		expectIncludes(dev, "pi remove ./", "`## 本地开发` 摘掉本地声明");

@@ -16,6 +16,7 @@ import type { LayerFSEngine } from "./layerfs-engine.ts";
 import { superviseChildProcess } from "./process-runner.ts";
 import type {
 	TaskRecord,
+	TaskRuntimeState,
 	TaskSpec,
 	UsageStats,
 } from "./types.ts";
@@ -30,6 +31,12 @@ export interface SubagentDispatchOptions {
 	onProgress?: () => void;
 	/** Hard timeout for a single worker process (default 15 minutes) */
 	workerTimeoutMs?: number;
+	/**
+	 * Prompt-cache retention for the worker (`PI_CACHE_RETENTION`).
+	 * Unset falls back to `PI_ORCHESTRATOR_CACHE_RETENTION`, then to "short";
+	 * an empty string disables the variable entirely.
+	 */
+	cacheRetention?: string;
 }
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
@@ -46,6 +53,213 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	}
 
 	return { command: "pi", args };
+}
+
+/** Default prompt-cache retention injected into every worker process. */
+export const DEFAULT_WORKER_CACHE_RETENTION = "short";
+
+/** The session id a worker persists its conversation under, reused per attempt. */
+export function workerSessionId(taskId: string): string {
+	return `worker-${taskId}`;
+}
+
+/**
+ * `workspaces/<task>/root` → `workspaces/<task>/sessions`.
+ *
+ * The sessions dir is a SIBLING of the workspace root: remounting wipes the root
+ * but not its parent, so attempt #2 finds the same `<sessionId>.jsonl` and pi
+ * resumes it by id without any extra flag.
+ */
+export function workerSessionDir(workspacePath: string): string {
+	const trimmed = workspacePath.replace(/[\\/]+$/, "");
+	if (!trimmed) return path.join(workspacePath, "sessions");
+	return path.join(path.dirname(trimmed), "sessions");
+}
+
+export interface WorkerCliOptions {
+	model?: string;
+	thinkingLevel?: string;
+}
+
+export interface WorkerCliResult {
+	/** Full pi CLI argument array; the prompt positional is pushed by the caller. */
+	args: string[];
+	/** Echoed back so the caller can `mkdir -p` it and record it on the task state. */
+	sessionDir: string;
+}
+
+/**
+ * PURE: builds the complete pi CLI argument array for a worker process.
+ *
+ * Never touches `fs` / `process`, so retries (attempt > 1) get byte-identical
+ * args: the same `--session-dir` + `--session-id` make pi restore and append to
+ * the existing jsonl session on its own.
+ */
+export function buildWorkerCliArgs(
+	taskId: string,
+	sessionDir: string,
+	opts: WorkerCliOptions = {},
+): WorkerCliResult {
+	const args: string[] = [
+		"--mode",
+		"json",
+		"-p",
+		"--session-dir",
+		sessionDir,
+		"--session-id",
+		workerSessionId(taskId),
+		"--tools",
+		"read,write,edit,bash",
+	];
+
+	if (opts.model) {
+		args.push("--model", opts.model);
+	}
+	if (opts.thinkingLevel) {
+		args.push("--thinking", opts.thinkingLevel);
+	}
+
+	return { args, sessionDir };
+}
+
+/**
+ * Resolution order: explicit option → `PI_ORCHESTRATOR_CACHE_RETENTION` → "short".
+ * An empty/blank resolved value means "do not set the variable at all".
+ * PURE: the caller passes the env snapshot it wants consulted.
+ */
+export function resolveCacheRetention(
+	explicit: string | undefined,
+	env: Record<string, string | undefined> = {},
+): string | undefined {
+	const raw = explicit ?? env.PI_ORCHESTRATOR_CACHE_RETENTION ?? DEFAULT_WORKER_CACHE_RETENTION;
+	const trimmed = raw.trim();
+	return trimmed === "" ? undefined : trimmed;
+}
+
+export interface WorkerSpawnEnvParams {
+	baseEnv: Record<string, string | undefined>;
+	taskId: string;
+	allowedCombined: readonly string[];
+	forbidden: readonly string[];
+	/** `scratchEnvironment()` output (TMPDIR / TMP / TEMP / XDG_CACHE_HOME) */
+	scratch: Record<string, string>;
+	/** `options.cacheRetention`; undefined falls back to env, then "short". */
+	cacheRetention?: string;
+}
+
+/**
+ * PURE: the env handed to `spawn()` for a worker process.
+ *
+ * `undefined` values are stripped (spawn would coerce them to the string
+ * "undefined") and `PI_CACHE_RETENTION` is only present when it resolves to a
+ * non-empty value — an inherited value is therefore actively removed when the
+ * caller asks for "no caching policy".
+ */
+export function buildWorkerSpawnEnv(params: WorkerSpawnEnvParams): Record<string, string> {
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(params.baseEnv)) {
+		if (typeof value === "string") env[key] = value;
+	}
+
+	env.PI_ORCHESTRATOR_WORKER = "1";
+	env.PI_ORCHESTRATOR_TASK_ID = params.taskId;
+	env.PI_ORCHESTRATOR_ALLOWED_FILES = JSON.stringify(params.allowedCombined);
+	env.PI_ORCHESTRATOR_FORBIDDEN_FILES = JSON.stringify(params.forbidden);
+
+	for (const [key, value] of Object.entries(params.scratch)) {
+		if (typeof value === "string") env[key] = value;
+	}
+
+	const cacheRetention = resolveCacheRetention(params.cacheRetention, params.baseEnv);
+	if (cacheRetention === undefined) {
+		delete env.PI_CACHE_RETENTION;
+	} else {
+		env.PI_CACHE_RETENTION = cacheRetention;
+	}
+
+	return env;
+}
+
+interface SessionFileCandidate {
+	path: string;
+	mtimeMs: number;
+}
+
+const SESSION_FILE_SUFFIX = ".jsonl";
+const SESSION_DIR_MAX_DEPTH = 4;
+
+/**
+ * `worker-<taskId>.jsonl`, or a pi-prefixed variant such as
+ * `<timestamp>_worker-<taskId>.jsonl`. Sibling task ids (`worker-t5-b`) must NOT
+ * match `worker-t5`.
+ */
+function isWorkerSessionStem(stem: string, sessionId: string): boolean {
+	if (stem === sessionId) return true;
+	if (stem.length <= sessionId.length || !stem.endsWith(sessionId)) return false;
+	const head = stem.slice(0, stem.length - sessionId.length);
+	return head.endsWith("_") || head.endsWith("-");
+}
+
+function collectWorkerSessionFiles(
+	dir: string,
+	sessionId: string,
+	depth: number,
+	out: SessionFileCandidate[],
+): void {
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+
+	for (const entry of entries) {
+		const full = path.join(dir, entry.name);
+		if (entry.isDirectory()) {
+			if (depth > 0) collectWorkerSessionFiles(full, sessionId, depth - 1, out);
+			continue;
+		}
+		if (!entry.isFile() || !entry.name.endsWith(SESSION_FILE_SUFFIX)) continue;
+		const stem = entry.name.slice(0, -SESSION_FILE_SUFFIX.length);
+		if (!isWorkerSessionStem(stem, sessionId)) continue;
+		try {
+			out.push({ path: full, mtimeMs: fs.statSync(full).mtimeMs });
+		} catch {
+			// A file that vanishes mid-scan is simply not a candidate.
+		}
+	}
+}
+
+/**
+ * Newest `worker-<taskId>.jsonl` under `sessionDir`, or `undefined`.
+ * Never throws: a missing dir, a permission error or an empty dir all mean
+ * "no session file to record yet".
+ */
+export function resolveWorkerSessionFile(sessionDir: string, taskId: string): string | undefined {
+	const candidates: SessionFileCandidate[] = [];
+	try {
+		collectWorkerSessionFiles(sessionDir, workerSessionId(taskId), SESSION_DIR_MAX_DEPTH, candidates);
+	} catch {
+		return undefined;
+	}
+	if (candidates.length === 0) return undefined;
+	candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || a.path.localeCompare(b.path));
+	return candidates[0].path;
+}
+
+/**
+ * Records the worker's actual session jsonl on the task state (best effort).
+ * Missing file → `undefined` (a stale value from an earlier attempt is cleared),
+ * never a throw.
+ */
+export function attachWorkerSessionFile(
+	state: Pick<TaskRuntimeState, "workerSessionFile">,
+	sessionDir: string,
+	taskId: string,
+): string | undefined {
+	const file = resolveWorkerSessionFile(sessionDir, taskId);
+	state.workerSessionFile = file;
+	return file;
 }
 
 export async function mapWithConcurrencyLimit<TIn, TOut>(
@@ -229,33 +443,41 @@ export async function runWaveTaskSubagent(
 	state.workspacePath = wsInfo.workspacePath;
 	state.baseLayerId = wsInfo.baseLayerId;
 
+	// Persist the worker conversation as a sibling of the (remountable) workspace
+	// root, so attempt > 1 resumes the SAME jsonl instead of starting cold.
+	const sessionDir = workerSessionDir(wsInfo.workspacePath);
+	try {
+		fs.mkdirSync(sessionDir, { recursive: true });
+	} catch {
+		// A missing sessions dir only costs cross-attempt resume; pi still runs.
+	}
+	state.recentActivity = [
+		...(state.recentActivity ?? []),
+		state.attempts > 1
+			? `Resuming worker session ${workerSessionId(spec.id)} from ${sessionDir} (attempt ${state.attempts}).`
+			: `Persisting worker session ${workerSessionId(spec.id)} to ${sessionDir} (attempt ${state.attempts}).`,
+	];
+
 	const sysPrompt = buildWorkerSystemPrompt(spec);
 	const userPrompt = buildWorkerTaskPrompt(record);
 	const tmpPrompt = await writeTempSystemPrompt(spec.id, sysPrompt);
 
-	const cliArgs: string[] = [
-		"--mode",
-		"json",
-		"-p",
-		"--no-session",
-		"--tools",
-		"read,write,edit,bash",
-		"--append-system-prompt",
-		tmpPrompt.filePath,
-	];
-
-	if (options.model) {
-		cliArgs.push("--model", options.model);
-	}
-	if (options.thinkingLevel) {
-		cliArgs.push("--thinking", options.thinkingLevel);
-	}
+	const workerCli = buildWorkerCliArgs(spec.id, sessionDir, {
+		model: options.model,
+		thinkingLevel: options.thinkingLevel,
+	});
+	const cliArgs = workerCli.args;
+	// The system prompt file is a runtime artifact, so it is appended here rather
+	// than inside the pure CLI builder; the prompt positional stays last.
+	cliArgs.push("--append-system-prompt", tmpPrompt.filePath);
 	cliArgs.push(userPrompt);
 
 	const allowedCombined = [...spec.allowedFiles, ...spec.testFiles];
 	let lastAssistantText = "";
 	let stderrBuf = "";
 	const workerTimeoutMs = options.workerTimeoutMs ?? 15 * 60 * 1000;
+	// Best effort only: the jsonl may not exist before pi starts or after a crash.
+	const captureWorkerSessionFile = () => attachWorkerSessionFile(state, sessionDir, spec.id);
 
 	try {
 		const exitCode = await new Promise<number>((resolve) => {
@@ -263,15 +485,17 @@ export async function runWaveTaskSubagent(
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: wsInfo.workspacePath,
 				stdio: ["ignore", "pipe", "pipe"],
-				env: {
-					...process.env,
-					PI_ORCHESTRATOR_WORKER: "1",
-					PI_ORCHESTRATOR_TASK_ID: spec.id,
-					PI_ORCHESTRATOR_ALLOWED_FILES: JSON.stringify(allowedCombined),
-					PI_ORCHESTRATOR_FORBIDDEN_FILES: JSON.stringify(spec.doNotTouch ?? []),
-					...scratchEnvironment(wsInfo),
-				},
+				env: buildWorkerSpawnEnv({
+					baseEnv: process.env,
+					taskId: spec.id,
+					allowedCombined,
+					forbidden: spec.doNotTouch ?? [],
+					scratch: scratchEnvironment(wsInfo),
+					cacheRetention: options.cacheRetention,
+				}),
 			});
+
+			captureWorkerSessionFile();
 
 			let stdoutLineBuf = "";
 
@@ -351,6 +575,9 @@ export async function runWaveTaskSubagent(
 					? `Subagent timed out after ${workerTimeoutMs}ms`
 					: stderrBuf.trim() || `Subagent exited with code ${exitCode}`;
 		}
+
+		// Authoritative capture: by now pi has flushed/appended the session jsonl.
+		captureWorkerSessionFile();
 
 		state.recentActivity = [...(state.recentActivity ?? []).slice(-5), "Committing LayerFS snapshot & running Mechanical Gate..."];
 		options.onProgress?.();

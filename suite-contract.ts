@@ -12,5 +12,6 @@ export const TEST_SUITE_COMMANDS: readonly string[] = [
 	"node ./test-waves.ts",
 	"node ./test-packaging-manifest.ts",
 	"node ./test-packaging-docs.ts",
+	"node ./test-worker-session.ts",
 	"node ./test-primitives.ts",
 ];

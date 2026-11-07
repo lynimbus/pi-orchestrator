@@ -171,6 +171,12 @@ export interface TaskRuntimeState {
 	thinkingUsed?: string;
 	lastError?: string;
 	recentActivity?: string[];
+	/**
+	 * Absolute path to the worker's persisted pi session jsonl under
+	 * `workspaces/<task>/sessions` (`worker-<taskId>.jsonl`). Undefined until the
+	 * worker actually wrote a session file (or when none could be found).
+	 */
+	workerSessionFile?: string;
 }
 
 export interface TaskRecord {
