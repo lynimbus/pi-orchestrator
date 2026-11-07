@@ -28,7 +28,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, StringEnum } from "@earendil-works/pi-ai";
 import {
 	type ExtensionAPI,
 	type ExtensionContext,
@@ -38,6 +38,22 @@ import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { LayerFSEngine } from "./layerfs-engine.ts";
 import { matchesAnyPattern } from "./path-patterns.ts";
+import {
+	DEFAULT_ORCHESTRATOR_CONFIG,
+	parseDefaultsFile,
+	readSessionState,
+	resolveSessionConfig,
+	serializeGlobalConfig,
+} from "./session-config.ts";
+import {
+	isThinkingLevelSupported,
+	parseModelSpec,
+	parseThinkingLevel,
+	resolveSubagentThinking,
+	thinkingMenuOptions,
+	unsupportedThinkingLevelMessage,
+} from "./thinking-levels.ts";
+import { declaredToolsForRun, orchestratorToolGate } from "./tool-gate.ts";
 import {
 	decideIntegrationAction,
 	decideRetryIntegrationAction,
@@ -63,40 +79,48 @@ import {
 	formatCommandDiagnostics,
 } from "./verifier.ts";
 
-const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
-
-const DEFAULT_CONFIG: OrchestratorConfig = {
-	enabled: false,
-	subagentModel: undefined,
-	subagentThinkingLevel: undefined,
-	maxConcurrency: 4,
-	maxRetries: 2,
-	requireHumanPlanApproval: false,
-	requireHumanFinalApproval: false,
-	allowAutoThreeWayLineMerge: true,
-};
-
+/**
+ * Path of the agent-dir file backing the seven global config keys. `saveGlobalConfig`
+ * is its only writer; the session switch lives in the `orchestrator-state` entry instead.
+ */
 function getConfigFilePath(): string {
 	return path.join(getAgentDir(), "orchestrator.json");
 }
 
-function loadConfig(): OrchestratorConfig {
-	const filePath = getConfigFilePath();
-	if (fs.existsSync(filePath)) {
-		try {
-			const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8"));
-			return { ...DEFAULT_CONFIG, ...parsed };
-		} catch {
-			return { ...DEFAULT_CONFIG };
-		}
+/**
+ * Reads the agent-dir `orchestrator.json`, the store for the seven global keys.
+ * The extension writes it through `saveGlobalConfig`, and `parseDefaultsFile`
+ * always drops a hand-edited `enabled`, so the shared file can never switch a
+ * session on. Absent, unreadable or unparseable content yields `undefined`,
+ * which leaves the defaults and session layers in charge.
+ */
+function loadConfig(): Partial<OrchestratorConfig> | undefined {
+	try {
+		return parseDefaultsFile(fs.readFileSync(getConfigFilePath(), "utf-8"));
+	} catch {
+		return undefined;
 	}
-	return { ...DEFAULT_CONFIG };
 }
 
-function saveConfig(config: OrchestratorConfig): void {
-	const filePath = getConfigFilePath();
-	fs.mkdirSync(path.dirname(filePath), { recursive: true });
-	fs.writeFileSync(filePath, JSON.stringify(config, null, 2), "utf-8");
+/**
+ * The thinking levels the model governing the subagent actually declares. `undefined`
+ * means the declaration is unavailable (registry miss, no model), which the policy
+ * modules treat as "do not filter" rather than as "nothing is supported".
+ */
+function supportedThinkingLevels(
+	ctx: ExtensionContext,
+	subagentModel: string | undefined,
+): readonly ThinkingLevel[] | undefined {
+	const configured = subagentModel && subagentModel !== "inherit" ? subagentModel : undefined;
+	const spec = configured === undefined ? undefined : parseModelSpec(configured);
+	try {
+		// A configured spec without a provider/modelId slash proves nothing about the levels.
+		if (configured !== undefined && spec === undefined) return undefined;
+		const model = spec ? ctx.modelRegistry.find(spec.provider, spec.modelId) : ctx.model;
+		return model ? (getSupportedThinkingLevels(model) as readonly ThinkingLevel[]) : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function toRelPath(cwd: string, targetPath: string): string {
@@ -156,7 +180,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		return;
 	}
 
-	let config: OrchestratorConfig = loadConfig();
+	let config: OrchestratorConfig = { ...DEFAULT_ORCHESTRATOR_CONFIG };
 	let activePlan: OrchestrationPlan | null = null;
 	let autoContinueNudgeCount = 0;
 
@@ -170,7 +194,8 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		type: "string",
 	});
 	pi.registerFlag("orch-thinking", {
-		description: "Default thinking level for Orchestrator subagents (off|minimal|low|medium|high|xhigh)",
+		description:
+			"Default thinking level for Orchestrator subagents (the levels declared by the configured subagent model)",
 		type: "string",
 	});
 
@@ -209,14 +234,11 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	}
 
 	function resolveEffectiveSubagentThinking(ctx: ExtensionContext): ThinkingLevel | undefined {
-		if (config.subagentThinkingLevel) {
-			return config.subagentThinkingLevel;
-		}
-		const lvl = ctx.thinkingLevel as ThinkingLevel | undefined;
-		if (lvl && THINKING_LEVELS.includes(lvl)) {
-			return lvl;
-		}
-		return undefined;
+		return resolveSubagentThinking({
+			configured: config.subagentThinkingLevel,
+			leadLevel: ctx.thinkingLevel as ThinkingLevel | undefined,
+			supported: supportedThinkingLevels(ctx, config.subagentModel),
+		});
 	}
 
 	function updateUI(ctx: ExtensionContext): void {
@@ -284,15 +306,37 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	}
 
 	function persistState(): void {
-		saveConfig(config);
 		pi.appendEntry("orchestrator-state", {
-			config,
+			enabled: config.enabled,
 			activePlan,
 		});
 	}
 
 	function commitState(ctx: ExtensionContext): void {
 		persistState();
+		updateUI(ctx);
+	}
+
+	/**
+	 * Writes the seven global keys to the agent-dir file. The patch is merged over
+	 * what is already on disk so a per-session flag override is never persisted,
+	 * and `serializeGlobalConfig` drops `enabled`, so the switch cannot leak into
+	 * the shared file. A failed write only reports through the UI: the in-memory
+	 * value is already applied and the command must not fail.
+	 */
+	function saveGlobalConfig(ctx: ExtensionContext, patch: Partial<OrchestratorConfig>): void {
+		const next = { ...(loadConfig() ?? {}), ...patch };
+		try {
+			fs.mkdirSync(path.dirname(getConfigFilePath()), { recursive: true });
+			fs.writeFileSync(getConfigFilePath(), serializeGlobalConfig(next), "utf-8");
+		} catch (error) {
+			ctx.ui.notify(`Failed to write orchestrator config: ${String(error)}`, "error");
+		}
+	}
+
+	function commitGlobalConfig(ctx: ExtensionContext, patch: Partial<OrchestratorConfig>): void {
+		Object.assign(config, patch);
+		saveGlobalConfig(ctx, patch);
 		updateUI(ctx);
 	}
 
@@ -1542,7 +1586,15 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
-		if (!config.enabled) return;
+		if (!config.enabled) {
+			// Pruning here (rather than only gating tool_call) also removes the tools from
+			// the prompt: pi appends a tool's promptGuidelines only while it is declared.
+			const options = event.systemPromptOptions;
+			if (options?.selectedTools) {
+				options.selectedTools = declaredToolsForRun(options.selectedTools, false);
+			}
+			return;
+		}
 		if (event.messageType !== "user") return;
 
 		const effectiveModel = resolveEffectiveSubagentModel(ctx) || "inherit";
@@ -1571,6 +1623,12 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 				display: false,
 			},
 		};
+	});
+
+	pi.on("tool_call", async (event) => {
+		// Authoritative for every path, including ctx.executeTool() and codemode calls that
+		// declaration hiding in before_agent_start cannot reach.
+		return orchestratorToolGate(event.toolName, config.enabled);
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
@@ -1728,7 +1786,7 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 				if (argModel) {
 					config.subagentModel =
 						argModel === "inherit" || argModel === "default" ? undefined : argModel;
-					commitState(ctx);
+					commitGlobalConfig(ctx, { subagentModel: config.subagentModel });
 					ctx.ui.notify(
 						`Subagent model set to: ${config.subagentModel || "(inherit lead model)"}`,
 						"info",
@@ -1744,16 +1802,26 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 				if (argThink) {
 					if (argThink === "inherit" || argThink === "default") {
 						config.subagentThinkingLevel = undefined;
-					} else if (THINKING_LEVELS.includes(argThink as ThinkingLevel)) {
-						config.subagentThinkingLevel = argThink as ThinkingLevel;
 					} else {
-						ctx.ui.notify(
-							`Invalid thinking level "${argThink}". Choose from: ${THINKING_LEVELS.join(", ")}, or inherit`,
-							"warning",
-						);
-						return;
+						const supported = supportedThinkingLevels(ctx, config.subagentModel);
+						const level = parseThinkingLevel(argThink);
+						if (level === undefined) {
+							ctx.ui.notify(
+								`Invalid thinking level "${argThink}".` +
+									(supported === undefined
+										? " The subagent model's declaration is unavailable; run /orch thinking to pick from the menu."
+										: ` Levels declared by the subagent model: ${supported.join(", ")}.`),
+								"warning",
+							);
+							return;
+						}
+						if (supported !== undefined && !isThinkingLevelSupported(level, supported)) {
+							ctx.ui.notify(unsupportedThinkingLevelMessage(level, supported), "warning");
+							return;
+						}
+						config.subagentThinkingLevel = level;
 					}
-					commitState(ctx);
+					commitGlobalConfig(ctx, { subagentThinkingLevel: config.subagentThinkingLevel });
 					ctx.ui.notify(
 						`Subagent thinking level set to: ${config.subagentThinkingLevel || "(inherit lead thinking)"}`,
 						"info",
@@ -1831,7 +1899,7 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 			config.subagentModel = choice;
 		}
 
-		commitState(ctx);
+		commitGlobalConfig(ctx, { subagentModel: config.subagentModel });
 		ctx.ui.notify(
 			`Subagent model set to: ${config.subagentModel || "(inherit lead model)"}`,
 			"info",
@@ -1839,12 +1907,8 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 	}
 
 	async function promptThinkingSelection(ctx: ExtensionContext): Promise<void> {
-		const options = [
-			"(inherit lead thinking)",
-			...THINKING_LEVELS.map((lvl) =>
-				lvl === config.subagentThinkingLevel ? `${lvl} (current)` : lvl,
-			),
-		];
+		const supported = supportedThinkingLevels(ctx, config.subagentModel);
+		const options = thinkingMenuOptions(supported, config.subagentThinkingLevel);
 
 		const choice = await ctx.ui.select(
 			`Select Subagent Thinking Level (current: ${config.subagentThinkingLevel || "inherit"})`,
@@ -1855,11 +1919,12 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 		if (choice === "(inherit lead thinking)") {
 			config.subagentThinkingLevel = undefined;
 		} else {
-			const clean = choice.replace(" (current)", "").trim() as ThinkingLevel;
-			config.subagentThinkingLevel = clean;
+			const picked = parseThinkingLevel(choice.replace(" (current)", "").trim());
+			if (picked === undefined) return;
+			config.subagentThinkingLevel = picked;
 		}
 
-		commitState(ctx);
+		commitGlobalConfig(ctx, { subagentThinkingLevel: config.subagentThinkingLevel });
 		ctx.ui.notify(
 			`Subagent thinking level set to: ${config.subagentThinkingLevel || "(inherit lead thinking)"}`,
 			"info",
@@ -1904,8 +1969,7 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 			if (val) {
 				const num = Number.parseInt(val, 10);
 				if (num >= 1 && num <= 8) {
-					config.maxConcurrency = num;
-					persistState();
+					commitGlobalConfig(ctx, { maxConcurrency: num });
 					ctx.ui.notify(`Max parallel subagents set to ${num}`, "info");
 				}
 			}
@@ -1917,21 +1981,20 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 			if (val !== undefined) {
 				const num = Number.parseInt(val, 10);
 				if (num >= 0 && num <= 5) {
-					config.maxRetries = num;
-					persistState();
+					commitGlobalConfig(ctx, { maxRetries: num });
 					ctx.ui.notify(`Max retries per task set to ${num}`, "info");
 				}
 			}
 		} else if (selected.startsWith("6.")) {
 			config.requireHumanPlanApproval = !config.requireHumanPlanApproval;
-			persistState();
+			commitGlobalConfig(ctx, { requireHumanPlanApproval: config.requireHumanPlanApproval });
 			ctx.ui.notify(
 				`Confirm Plan Before Dispatch: ${config.requireHumanPlanApproval ? "ON" : "OFF"}`,
 				"info",
 			);
 		} else if (selected.startsWith("7.")) {
 			config.requireHumanFinalApproval = !config.requireHumanFinalApproval;
-			persistState();
+			commitGlobalConfig(ctx, { requireHumanFinalApproval: config.requireHumanFinalApproval });
 			ctx.ui.notify(
 				`Confirm Before Final Integration: ${config.requireHumanFinalApproval ? "ON" : "OFF"}`,
 				"info",
@@ -1948,33 +2011,34 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
-		config = loadConfig();
-
+		// Two precedence chains. The switch is defaults < session entry < --orch, because
+		// `enabled` must follow one session. The seven global keys are defaults <
+		// orchestrator.json < --orch-model/--orch-thinking; those flag overrides apply to
+		// this session only and are never written back into the shared file.
+		const flagOverrides: Partial<OrchestratorConfig> = {};
 		if (pi.getFlag("orch") === true) {
-			config.enabled = true;
+			flagOverrides.enabled = true;
 		}
 		const flagModel = pi.getFlag("orch-model");
 		if (typeof flagModel === "string" && flagModel.trim()) {
-			config.subagentModel = flagModel.trim();
+			flagOverrides.subagentModel = flagModel.trim();
 		}
 		const flagThinking = pi.getFlag("orch-thinking");
-		if (
-			typeof flagThinking === "string" &&
-			THINKING_LEVELS.includes(flagThinking.trim() as ThinkingLevel)
-		) {
-			config.subagentThinkingLevel = flagThinking.trim() as ThinkingLevel;
+		if (typeof flagThinking === "string") {
+			const parsedThinking = parseThinkingLevel(flagThinking);
+			if (parsedThinking !== undefined) {
+				flagOverrides.subagentThinkingLevel = parsedThinking;
+			}
 		}
 
-		const entries = ctx.sessionManager.getEntries();
-		const lastEntry = entries
-			.filter((e: any) => e.type === "custom" && e.customType === "orchestrator-state")
-			.pop() as { data?: { config?: OrchestratorConfig; activePlan?: OrchestrationPlan | null } } | undefined;
+		const resolved = resolveSessionConfig({
+			fileDefaults: loadConfig(),
+			sessionState: readSessionState(ctx.sessionManager.getEntries()),
+			flagOverrides,
+		});
+		config = resolved.config;
+		activePlan = resolved.activePlan;
 
-		if (lastEntry?.data?.activePlan) {
-			activePlan = lastEntry.data.activePlan;
-		}
-
-		saveConfig(config);
 		updateUI(ctx);
 	});
 }
@@ -2010,12 +2074,22 @@ function formatOrchestratorStatusReport(
 	diag?: StatusDiagnostics,
 ): string {
 	const leadModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown";
+	const declaredThinking = supportedThinkingLevels(ctx, config.subagentModel);
+	const configuredThinking = config.subagentThinkingLevel;
+	// A level the resolved model no longer declares is not in force: pi clamps it inside the
+	// worker session, so the report must not print it as if it were the level being used.
+	const subagentThinking =
+		configuredThinking === undefined
+			? `(inherit: ${ctx.thinkingLevel || "default"})`
+			: isThinkingLevelSupported(configuredThinking, declaredThinking)
+				? configuredThinking
+				: `${configuredThinking} ⚠ UNSUPPORTED by the resolved subagent model (declared: ${(declaredThinking ?? []).join(", ") || "unknown"}); pi clamps it in the worker session`;
 	const lines: string[] = [
 		`⚡ Pi Orchestrator Status`,
 		`- Workflow Switch: ${config.enabled ? "ENABLED (Strict Enforcement)" : "DISABLED"}`,
 		`- Lead Agent Model: ${leadModel} (thinking: ${ctx.thinkingLevel || "default"})`,
 		`- Subagent Model: ${config.subagentModel || `(inherit: ${leadModel})`}`,
-		`- Subagent Thinking: ${config.subagentThinkingLevel || `(inherit: ${ctx.thinkingLevel || "default"})`}`,
+		`- Subagent Thinking: ${subagentThinking}`,
 		`- Concurrency: ${config.maxConcurrency} | Max Retries: ${config.maxRetries}`,
 		`- LayerFS Store: ${metrics.storeRoot}`,
 		`  Layers: ${metrics.layerCount} | Branches: ${metrics.branchCount} | Commits: ${metrics.commitCount} | Objects: ${metrics.objectCount}`,
