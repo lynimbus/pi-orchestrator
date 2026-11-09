@@ -337,13 +337,13 @@ test(
 );
 
 test(
-	"README 说明关闭状态下八个 orch 工具既不声明给模型也不可调用",
+	"README 说明关闭状态下八个 orch 工具既不声明给模型也不可调用，仅暴露 orch_mode",
 	() => {
 		const usage = getSection("快速上手");
 		expectIncludes(usage, "既不声明", "工具声明移除说明");
 		expectIncludes(usage, "无法调用", "不可调用说明");
 		expectIncludes(usage, "system prompt", "工具指南一并移除说明");
-		expectIncludes(usage, "/orch on", "拦截理由指向 `/orch on`");
+		expectIncludes(usage, "orch_mode", "拦截理由指向 orch_mode，且它是关闭时唯一可见的 orch 工具");
 		for (const tool of ORCHESTRATOR_TOOL_NAMES) {
 			expectIncludes(usage, tool, `关闭时不可用的工具 ${tool}`);
 		}
@@ -405,7 +405,7 @@ test(
 );
 
 test(
-	"README 说明开关跟随会话、其余七项全局配置写入 orchestrator.json",
+	"README 说明开关跟随会话、其余八项全局配置写入 orchestrator.json",
 	() => {
 		expectNotIncludes(readme, "配置文件持久化保存在", "全局持久化声明");
 		expectNotIncludes(readme, "永远不会写", "扩展从不写 orchestrator.json 的旧断言");
@@ -414,20 +414,21 @@ test(
 		expectIncludes(usage, "orchestrator-state", "开关由会话自己的 `orchestrator-state` 条目承载");
 		expectIncludes(usage, "`enabled`", "`enabled` 字段说明");
 		expectIncludes(usage, "跟随", "开关跟随当前会话");
-		expectIncludes(usage, "~/.pi/agent/orchestrator.json", "七项全局配置文件路径");
-		expectIncludes(usage, "全局配置", "其余七项是全局配置");
+		expectIncludes(usage, "~/.pi/agent/orchestrator.json", "八项全局配置文件路径");
+		expectIncludes(usage, "全局配置", "其余八项是全局配置");
 		expectIncludes(usage, "写入", "`/orch` 与菜单修改会写入该文件");
 		expectIncludes(usage, "之后启动的会话", "写入对之后启动的会话生效");
 		expectIncludes(usage, "忽略", "文件里的 `enabled` 被忽略");
 		expectIncludes(usage, "--orch", "`--orch` 只为当次会话强制开启");
 		expectIncludes(usage, "--orch-model", "`--orch-model` 当次覆盖");
 		expectIncludes(usage, "--orch-thinking", "`--orch-thinking` 当次覆盖");
+		expectIncludes(usage, "--orch-skills", "`--orch-skills` 当次覆盖");
 		expectIncludes(usage, "不落盘", "flag 覆盖不写入共享文件");
 		expectIncludes(usage, "内置默认值", "优先级最低层：内置默认值");
 		expectIncludes(usage, "会话条目", "开关优先级：会话条目");
 		expectIncludes(usage, "CLI 参数", "开关优先级最高层：CLI 参数");
 		expectIncludes(usage, "两条", "两条生效优先级链");
-		expectIncludes(usage, "七项", "七项全局配置的优先级链");
+		expectIncludes(usage, "八项", "八项全局配置的优先级链");
 	},
 );
 
@@ -521,10 +522,9 @@ test(
 			"/orch thinking",
 			"/orch status",
 			"/orch reset",
-			"/orch on",
-			"/orch off",
-			"/orch toggle",
-			"Ctrl+Alt+O",
+			"/orch skills",
+			"orch_mode",
+			"--orch-skills",
 			"orch_plan",
 			"orch_dispatch",
 			"orch_review",

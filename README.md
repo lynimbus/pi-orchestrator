@@ -1,6 +1,6 @@
 # Pi Orchestrator
 
-独立的通用 Pi 插件（仓库：<https://github.com/lynimbus/pi-orchestrator>），以 **Pi git 包**的形式从 GitHub 安装与更新：克隆、缓存、版本解析全部由 Pi 管理，你不需要再手工把文件拷进 `~/.pi/agent/extensions/`。开启后强制执行 **「主代理拆解任务 → LayerFS 分支隔离并行派发子代理（强制配套单元测试） → 机械门禁校验 → 主代理仅审查 Diff 与测试 → LayerFS 三路合并与集成验证」** 工作流。
+独立的通用 Pi 插件（仓库：<https://github.com/lynimbus/pi-orchestrator>），以 **Pi git 包**的形式从 GitHub 安装与更新：克隆、缓存、版本解析全部由 Pi 管理，你不需要再手工把文件拷进 `~/.pi/agent/extensions/`。开启后强制执行 **「主代理拆解任务 → LayerFS 分支隔离并行派发子代理（强制配套单元测试） → 机械门禁校验 → 主代理仅审查 Diff 与测试 → LayerFS 三路合并与集成验证」** 工作流。开关本身属于模型：`orch_mode` 工具始终可见，由模型自主开启/关闭编排模式，关闭时其余 `orch_*` 工具不声明（详见「快速上手」）。
 
 ## 安装
 
@@ -83,28 +83,46 @@ npm test        # node ./test.ts && node ./test-regressions.ts && node ./test-wa
 
 ## 快速上手
 
-### 1. 开关与配置命令
+### 1. 开关属于模型（留迹通讯式设计）
+
+用户侧不再有 on/off 开关：没有 `/orch on|off|toggle`，也没有 `Ctrl+Alt+O`。取而代之的是**始终声明给模型的 `orch_mode` 工具**——关闭状态下唯一可见的 orch 工具。模型判断「这个请求值得拆解成并行子任务」时自行调用 `orch_mode(action: "on")` 开启；编排完成或用户喊停时调用 `orch_mode(action: "off")` 关闭（会清掉活动计划）；不传 action 则报告当前状态。这借鉴蚂蚁的留迹通讯（Stigmergy）：不做事前协商，把开关本身作为环境中的痕迹，谁观察到、谁行动。用户保留的唯一引导手段是启动参数 `--orch`，为当次会话强制开启。只有开关打开时，其余八个 `orch_*` 工作流工具才会声明给模型（见下文「关闭时」）。
+
+### 2. 配置命令
+
 在 Pi 交互界面中：
-- **`/orch`**：打开交互式设置菜单（开关工作流、选择子代理模型、调节子代理思考等级、并发度、重试上限、人工确认点、查看 LayerFS 存储去重指标等）
-- **`Ctrl+Alt+O`**：一键切换 Orchestrator 强制工作流 **ON / OFF**
-- **`/orch on` / `/orch off` / `/orch toggle`**：命令行开启或关闭工作流
+- **`/orch`**：打开交互式设置菜单（选择子代理模型、调节子代理思考等级、并发度、重试上限、人工确认点、子代理初始 skill、查看 LayerFS 存储去重指标等）
 - **`/orch model [provider/modelId | inherit]`**：调节子代理使用的模型（不传参数则弹出模型选择列表；设为 `inherit` 则跟随主代理当前模型）
 - **`/orch thinking [等级]`**：调节子代理思考等级（不传参数则弹出等级选择列表；传 `inherit` 则跟随主代理当前等级）。可选的等级**不是固定枚举**，而是跟随所选子代理模型自己的声明：pi 依据模型的 `reasoning` 标志与 `thinkingLevelMap` 推导——把某个等级映射为 `null` 的模型不提供该等级，声明了 `max` 的模型则提供 `max`。例如 `magpie/group/deepseek` 声明 `off / low / high / max`，`magpie/group/hy4` 只声明 `high`。无法解析出声明时（例如手写自定义 model id、或所选模型不在注册表里），orch 不做过滤；已配置的等级若不被模型声明，会在派工时被丢弃，交由 worker 会话里 pi 自己的 clamping 决定，而不是被静默改写成相邻等级。
+- **`/orch skills [名称1,名称2 | clear]`**：设置**授予每个子代理的初始 skill**（不传参数则弹出输入框；`clear` 或空输入清空，回到「环境自取」默认）。名称按 skill 发现目录解析成路径后经 `pi --skill` 注入 worker，也可直接写路径；详见下文「子代理与 skill」
 - **`/orch status`**：查看当前任务波次状态与 LayerFS 对象存储去重统计
 - **`/orch reset`**：重置当前正在执行的编排计划
 
 启动时也可通过 CLI 参数直接控制（`--orch-model` 接受 `provider/modelId`，按**第一个** `/` 切分，所以 `magpie/group/deepseek` 是 provider `magpie` + model id `group/deepseek`）；示例里的思考等级取该模型自己声明过的值：
 ```bash
-pi --orch --orch-model magpie/group/deepseek --orch-thinking high
+pi --orch --orch-model magpie/group/deepseek --orch-thinking high --orch-skills poteto-mode
 ```
 
-**开关 `enabled` 跟随当前会话，其余七项是全局配置**：开关保存在该会话自己的 `orchestrator-state` 条目里，所以切换会话不再把开关带过去。子代理模型、思考等级、并发度、重试上限、两个人工确认点与自动三路行合并这七项全局配置保存在 `~/.pi/agent/orchestrator.json`：`/orch` 命令与交互菜单修改它们时会写入该文件，对之后启动的会话生效；文件里即使写了 `enabled` 也按设计被忽略，共享文件永远不会替任何会话开关工作流。`--orch` 只为它被传入的那个会话强制开启；`--orch-model` / `--orch-thinking` 只覆盖当次会话，不落盘。
+**开关 `enabled` 跟随当前会话，其余八项是全局配置**：开关保存在该会话自己的 `orchestrator-state` 条目里（`orch_mode` 在运行时改写的就是这个条目），所以切换会话不再把开关带过去。子代理模型、思考等级、并发度、重试上限、两个人工确认点、自动三路行合并与子代理初始 skill（`subagentSkills`）这八项全局配置保存在 `~/.pi/agent/orchestrator.json`：`/orch` 命令与交互菜单修改它们时会写入该文件，对之后启动的会话生效；文件里即使写了 `enabled` 也按设计被忽略，共享文件永远不会替任何会话开关工作流。`--orch` 只为它被传入的那个会话强制开启；`--orch-model` / `--orch-thinking` / `--orch-skills` 只覆盖当次会话，不落盘。
 
 两条生效优先级链（由低到高）：
-- **开关**：内置默认值 → 会话条目（`orchestrator-state`）→ CLI 参数（`--orch`）。
-- **其余七项全局配置**：内置默认值 → `~/.pi/agent/orchestrator.json` → 当次 CLI 覆盖（`--orch-model` / `--orch-thinking`，不落盘）。
+- **开关**：内置默认值 → 会话条目（`orchestrator-state`，由 `orch_mode` 运行时改写）→ CLI 参数（`--orch`）。
+- **其余八项全局配置**：内置默认值 → `~/.pi/agent/orchestrator.json` → 当次 CLI 覆盖（`--orch-model` / `--orch-thinking` / `--orch-skills`，不落盘）。
 
-**关闭（OFF）时没有任何 `orch_*` 能力可用**：八个工具 `orch_plan`、`orch_wave0_commit`、`orch_dispatch`、`orch_review`、`orch_integrate`、`orch_retry_integration`、`orch_rollback_integration`、`orch_status` **既不声明给模型，也无法调用**——本次运行会移除它们的工具声明以及随声明下发的 system prompt 指南；万一仍有调用抵达扩展，会被拦截并附上理由，提示模型先执行 `/orch on`。
+**关闭（OFF）时只暴露 `orch_mode` 一个工具**：八个工作流工具 `orch_plan`、`orch_wave0_commit`、`orch_dispatch`、`orch_review`、`orch_integrate`、`orch_retry_integration`、`orch_rollback_integration`、`orch_status` **既不声明给模型，也无法调用**——本次运行会移除它们的工具声明以及随声明下发的 system prompt 指南；万一仍有调用抵达扩展，会被拦截并附上理由，提示模型改调 `orch_mode` 开启。运行中途开启时，八个工具自下一个 agent run 起声明。
+
+### 3. 子代理与 skill（环境自取 + 初始授予）
+
+子代理是独立的 `pi` 进程，天然继承 skill 发现：agent 目录（`~/.pi/agent/skills/`）的用户级 skill、LayerFS 工作区内仓库自带的 `.agents/skills/` 项目级 skill，worker 都能自己看到、自己取用——**不需要事前协商谁该拿哪个 skill**，这是留迹通讯的默认路径。
+
+但有两类 skill 靠发现取不到，需要显式授予（派发时解析成路径、经 `pi --skill <path>` 注入 worker）：
+- **`disable-model-invocation: true` 的 skill**（如 `poteto-mode`）：不进提示词的 skill 列表，worker 的模型根本看不见它；
+- **希望开工即生效的 skill**：不想等 worker 自己判断要不要读。
+
+两层手动授予：
+- **全局**：`/orch skills poteto-mode`（写入 `orchestrator.json` 的 `subagentSkills` 数组）或 `--orch-skills poteto-mode,commit-style`（当次会话覆盖），对所有子代理生效；
+- **按任务**：`orch_plan` 任务规格里可选 `skills: [...]`，在该任务的全局列表之上追加。
+
+解析顺序：agent 目录 skills → `~/.agents/skills` → 项目 `.agents/skills` / `.pi/skills` / `.pig/skills`；条目含路径分隔符或以 `.md` 结尾时按路径直接使用。解析不到的条目**不阻断派发**：跳过并在派发审查包里标注——环境里的陈旧名字不该卡住工作，先到先得，后来者自行适配。
 
 ---
 
@@ -178,18 +196,18 @@ npm test    # node ./test.ts && node ./test-regressions.ts && node ./test-waves.
 - `node ./test-packaging-manifest.ts`：包清单契约（`package.json` 的 `pi.extensions`、入口文件、`npm test` 脚本段数等）
 - `node ./test-packaging-docs.ts`：纯文本契约测试，保证这份 README 的安装/更新/迁移叙事不会退回「手工拷贝目录」的老写法，并校验本节的分段注释与 `suite-contract.ts` 逐段一致
 - `node ./test-thinking-levels.ts`：思考等级策略用例（等级菜单只列模型声明的等级、不被声明的配置等级被丢弃且给出提示、`inherit` 回退、不声明时不过滤）
-- `node ./test-tool-gate.ts`：工具可用性闸门用例（八个 `orch_*` 名称集合、关闭时的 `tool_call` 拦截理由、关闭时声明的裁剪）
-- `node ./test-session-config.ts`：配置存储用例（开关的默认值 / 会话条目 / CLI 参数优先级，七项全局配置的 `orchestrator.json` 解析与序列化、`enabled` 被忽略、损坏输入降级到默认值）
-- `node ./test-extension-wiring.ts`：`index.ts` 接线用例（`before_agent_start` 裁剪声明、`tool_call` 闸门、`orchestrator-state` 只存开关与计划、八处全局设置写入 `orchestrator.json`、`/orch thinking` 菜单与校验跟随模型声明）
-- `node ./test-worker-session.ts`：worker session 用例（`sessions/` 目录不进 commit / host import、`suite-contract.ts` 十一段链、README 契约）
-- `node ./test-primitives.ts`：共享原语单测（`path-patterns.ts` 的路径归一化 / glob 匹配、`workspace-env.ts` 的 scratch 目录、`process-runner.ts` 的超时与 SIGTERM→SIGKILL、`suite-contract.ts` 的测试套件命令单一来源）
+- `node ./test-tool-gate.ts`：工具可用性闸门用例（八个 `orch_*` 名称集合、`orch_mode` 开关工具不在闸门名单内、关闭时的 `tool_call` 拦截理由指向 `orch_mode`、关闭时声明的裁剪保留 `orch_mode`）
+- `node ./test-session-config.ts`：配置存储用例（开关的默认值 / 会话条目 / CLI 参数优先级，八项全局配置的 `orchestrator.json` 解析与序列化、`enabled` 被忽略、损坏输入降级到默认值）
+- `node ./test-extension-wiring.ts`：`index.ts` 接线用例（`orch_mode` 模型开关工具的注册与闸门豁免、用户侧开关移除、`before_agent_start` 裁剪声明、`tool_call` 闸门、`orchestrator-state` 只存开关与计划、十处全局设置写入 `orchestrator.json`、派发时按任务解析授予 skill、`/orch thinking` 菜单与校验跟随模型声明）
+- `node ./test-worker-session.ts`：worker session 用例（`buildWorkerCliArgs` 的 session/cache/skill 参数构造、`sessions/` 目录不进 commit / host import、`suite-contract.ts` 十一段链、README 契约）
+- `node ./test-primitives.ts`：共享原语单测（`path-patterns.ts` 的路径归一化 / glob 匹配、`skill-paths.ts` 的授予 skill 解析、`workspace-env.ts` 的 scratch 目录、`process-runner.ts` 的超时与 SIGTERM→SIGKILL、`suite-contract.ts` 的测试套件命令单一来源）
 
 覆盖说明：
 
 - `test-regressions.ts` 覆盖：重复 integrate 被拒且宿主不变、跨分支新增文件不丢、宿主快照/校验/回滚/重合并、可执行位、非相关漂移、TMPDIR/诊断/超时、损坏 meta、source root 绑定、集成状态机。
-- `test-worker-session.ts` 覆盖：`buildWorkerCliArgs` 的 session/cache 参数构造（worker 会话落盘 `workspaces/<task>/sessions`、`TMPDIR`/`XDG_CACHE_HOME` 指向 scratch 目录），以及 `layerfs-engine.ts` 的 `IGNORED_DIRS` 把 `sessions` 与 `.tmp`/`.cache` 同等对待（`commitWorkspace` / `importHostAsLayer` 都不捕获）。
+- `test-worker-session.ts` 覆盖：`buildWorkerCliArgs` 的 session/cache/skill 参数构造（worker 会话落盘 `workspaces/<task>/sessions`、`TMPDIR`/`XDG_CACHE_HOME` 指向 scratch 目录、授予 skill 逐个 `--skill` 注入），以及 `layerfs-engine.ts` 的 `IGNORED_DIRS` 把 `sessions` 与 `.tmp`/`.cache` 同等对待（`commitWorkspace` / `importHostAsLayer` 都不捕获）。
 - `test-thinking-levels.ts` 覆盖：`thinking-levels.ts` 的纯策略——等级解析与校验、子代理等级解析（配置优先于主代理等级）、模型声明缺失时不过滤、等级菜单只列已声明等级。
-- `test-tool-gate.ts` 覆盖：`tool-gate.ts` 的纯策略——`isOrchestratorTool` 与 `ORCHESTRATOR_TOOL_NAMES`、关闭时的 `tool_call` 拦截与理由、`declaredToolsForRun` 只在前述开关下裁掉 `orch_*`。
-- `test-session-config.ts` 覆盖：`session-config.ts` 的纯策略——`orchestrator.json` 解析与序列化（`enabled` 始终被丢弃）、会话条目读取、`resolveSessionConfig` 的开关与全局七键两条优先级链、不合法字段降级。
-- `test-extension-wiring.ts` 覆盖：`index.ts` 的接线契约——思考等级取自 `getSupportedThinkingLevels` 而不落回固定枚举、`before_agent_start` 在关闭时裁剪 `selectedTools`、`tool_call` 走 `orchestratorToolGate`、`session_start` 走 `resolveSessionConfig` 且 `--orch` 最后应用、会话条目只存开关与计划、八处全局设置经 `commitGlobalConfig` 写入 `orchestrator.json`。
-- `test-primitives.ts` 覆盖：`path-patterns.ts`、`workspace-env.ts`、`process-runner.ts`、`suite-contract.ts` 四个共享原语的单元行为，以及它们与 `suite-contract.ts` 中 `TEST_SUITE_COMMANDS`（十一段）的一致性。
+- `test-tool-gate.ts` 覆盖：`tool-gate.ts` 的纯策略——`isOrchestratorTool` 与 `ORCHESTRATOR_TOOL_NAMES`、`orch_mode` 开关工具不在闸门名单内、关闭时的 `tool_call` 拦截与理由、`declaredToolsForRun` 只在前述开关下裁掉八个 `orch_*` 而始终保留 `orch_mode`。
+- `test-session-config.ts` 覆盖：`session-config.ts` 的纯策略——`orchestrator.json` 解析与序列化（`enabled` 始终被丢弃）、会话条目读取、`resolveSessionConfig` 的开关与全局八键两条优先级链、不合法字段降级。
+- `test-extension-wiring.ts` 覆盖：`index.ts` 的接线契约——思考等级取自 `getSupportedThinkingLevels` 而不落回固定枚举、`orch_mode` 模型开关工具注册且不在闸门名单、用户侧 on/off 开关移除、`before_agent_start` 在关闭时裁剪 `selectedTools`、`tool_call` 走 `orchestratorToolGate`、`session_start` 走 `resolveSessionConfig` 且 `--orch` 最后应用、会话条目只存开关与计划、十处全局设置经 `commitGlobalConfig` 写入 `orchestrator.json`、派发时按任务解析授予 skill。
+- `test-primitives.ts` 覆盖：`path-patterns.ts`、`skill-paths.ts`、`workspace-env.ts`、`process-runner.ts`、`suite-contract.ts` 五个共享原语的单元行为，以及它们与 `suite-contract.ts` 中 `TEST_SUITE_COMMANDS`（十一段）的一致性。

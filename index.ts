@@ -17,15 +17,20 @@
  *
  * Commands & Shortcuts:
  * - `/orch`            : Interactive configuration & status menu
- * - `/orch on|off`     : Enable / disable strict Orchestrator workflow
  * - `/orch model [id]` : Configure Subagent model (or `inherit`)
  * - `/orch thinking [level]` : Configure Subagent thinking level (or `inherit`)
+ * - `/orch skills [list|clear]` : Skills granted to every subagent worker at spawn
  * - `/orch status`     : Show active plan, wave status & LayerFS store metrics
  * - `/orch reset`      : Reset active orchestration plan
- * - `Ctrl+Alt+O`       : Quick toggle Orchestrator mode ON/OFF
+ * - `--orch`           : Bootstrap flag: start the session with the mode enabled
+ *
+ * The ON/OFF switch belongs to the MODEL, not the user (stigmergy). The `orch_mode`
+ * tool is always declared, it is the only orchestrator tool exposed while the mode is
+ * OFF, and only while the mode is ON do the eight `orch_*` workflow tools appear.
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { getSupportedThinkingLevels, StringEnum } from "@earendil-works/pi-ai";
@@ -46,6 +51,11 @@ import {
 	serializeGlobalConfig,
 } from "./session-config.ts";
 import {
+	mergeSkillLists,
+	parseSkillList,
+	skillPathCandidates,
+} from "./skill-paths.ts";
+import {
 	isThinkingLevelSupported,
 	parseModelSpec,
 	parseThinkingLevel,
@@ -53,7 +63,11 @@ import {
 	thinkingMenuOptions,
 	unsupportedThinkingLevelMessage,
 } from "./thinking-levels.ts";
-import { declaredToolsForRun, orchestratorToolGate } from "./tool-gate.ts";
+import {
+	ORCHESTRATOR_MODE_TOOL_NAME,
+	declaredToolsForRun,
+	orchestratorToolGate,
+} from "./tool-gate.ts";
 import {
 	decideIntegrationAction,
 	decideRetryIntegrationAction,
@@ -80,7 +94,7 @@ import {
 } from "./verifier.ts";
 
 /**
- * Path of the agent-dir file backing the seven global config keys. `saveGlobalConfig`
+ * Path of the agent-dir file backing the eight global config keys. `saveGlobalConfig`
  * is its only writer; the session switch lives in the `orchestrator-state` entry instead.
  */
 function getConfigFilePath(): string {
@@ -88,7 +102,7 @@ function getConfigFilePath(): string {
 }
 
 /**
- * Reads the agent-dir `orchestrator.json`, the store for the seven global keys.
+ * Reads the agent-dir `orchestrator.json`, the store for the eight global keys.
  * The extension writes it through `saveGlobalConfig`, and `parseDefaultsFile`
  * always drops a hand-edited `enabled`, so the shared file can never switch a
  * session on. Absent, unreadable or unparseable content yields `undefined`,
@@ -127,6 +141,48 @@ function toRelPath(cwd: string, targetPath: string): string {
 	const resolved = path.resolve(cwd, targetPath);
 	const rel = path.relative(cwd, resolved);
 	return rel.replace(/\\/g, "/");
+}
+
+/**
+ * Skill discovery roots, mirroring pi's own lookup order: the agent dir first,
+ * then the user-level Agent Skills location, then the project locations under
+ * the lead's cwd. Bare configured names are probed against these in order;
+ * path-like entries bypass the roots entirely.
+ */
+function skillDiscoveryRoots(cwd: string): string[] {
+	return [
+		path.join(getAgentDir(), "skills"),
+		path.join(os.homedir(), ".agents", "skills"),
+		path.join(cwd, ".agents", "skills"),
+		path.join(cwd, ".pi", "skills"),
+		path.join(cwd, ".pig", "skills"),
+	];
+}
+
+/**
+ * Turns configured skill entries into existing paths. The first candidate that
+ * exists wins. Entries that resolve nowhere land in `missing` so the dispatch
+ * packet can surface them without blocking the wave. A stale name in the
+ * environment must not stall the work; the wave adapts to the current state.
+ */
+function resolveGrantedSkills(
+	entries: readonly string[],
+	roots: readonly string[],
+	cwd: string,
+): { resolved: Array<{ entry: string; path: string }>; missing: string[] } {
+	const resolved: Array<{ entry: string; path: string }> = [];
+	const missing: string[] = [];
+	for (const entry of entries) {
+		const hit = skillPathCandidates(entry, roots).find((candidate) =>
+			fs.existsSync(path.resolve(cwd, candidate)),
+		);
+		if (hit !== undefined) {
+			resolved.push({ entry, path: path.resolve(cwd, hit) });
+		} else {
+			missing.push(entry);
+		}
+	}
+	return { resolved, missing };
 }
 
 function setupSubagentWorkerMode(pi: ExtensionAPI): void {
@@ -196,6 +252,11 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	pi.registerFlag("orch-thinking", {
 		description:
 			"Default thinking level for Orchestrator subagents (the levels declared by the configured subagent model)",
+		type: "string",
+	});
+	pi.registerFlag("orch-skills", {
+		description:
+			"Comma-separated skills granted to Orchestrator subagents for this session (names or paths, on top of the global config)",
 		type: "string",
 	});
 
@@ -318,7 +379,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * Writes the seven global keys to the agent-dir file. The patch is merged over
+	 * Writes the eight global keys to the agent-dir file. The patch is merged over
 	 * what is already on disk so a per-session flag override is never persisted,
 	 * and `serializeGlobalConfig` drops `enabled`, so the switch cannot leak into
 	 * the shared file. A failed write only reports through the UI: the in-memory
@@ -351,6 +412,86 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		);
 	}
 
+	pi.registerTool({
+		name: ORCHESTRATOR_MODE_TOOL_NAME,
+		label: "Orchestrator: Mode Switch",
+		description:
+			"Turn the strict Lead-Subagent TDD Orchestrator ON or OFF for this session, or report its current state. While OFF, the eight orch_* workflow tools stay hidden; turning ON exposes them.",
+		promptSnippet: "Enable or disable the Lead-Subagent orchestrator workflow",
+		promptGuidelines: [
+			'Call orch_mode with action "on" when the user\'s request decomposes into multiple parallelizable coding tasks that would benefit from isolated subagent workers.',
+			'Call orch_mode with action "off" when the orchestrated work is complete, or the user asks to stop orchestrating.',
+			"Call orch_mode with action \"status\" (or omit the action) to check the current mode and configuration.",
+		],
+		parameters: Type.Object({
+			action: Type.Optional(
+				StringEnum(["on", "off", "status"] as const, {
+					description:
+						"'on' enables the orchestrator, 'off' disables it and clears the active plan, 'status' (default) reports the current mode",
+				}),
+			),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const action = params.action ?? "status";
+
+			if (action === "on") {
+				const alreadyOn = config.enabled;
+				config.enabled = true;
+				commitState(ctx);
+				return {
+					content: [
+						{
+							type: "text",
+							text: alreadyOn
+								? `Orchestrator Mode is already ON (subagent model: ${config.subagentModel || "inherit"}, thinking: ${config.subagentThinkingLevel || "inherit"}).`
+								: [
+										`⚡ Orchestrator Mode ENABLED (subagent model: ${config.subagentModel || "inherit"}, thinking: ${config.subagentThinkingLevel || "inherit"}).`,
+										"",
+										"The eight orch_* workflow tools are now exposed (they are declared from your next agent run; if a call is rejected this turn, retry it after the turn ends).",
+										"Workflow: inspect the codebase READ-ONLY, then `orch_plan` → `orch_wave0_commit` (optional) → `orch_dispatch` → `orch_review` → `orch_integrate`, wave by wave.",
+										'When the orchestration is complete, call orch_mode with action "off".',
+									].join("\n"),
+						},
+					],
+				};
+			}
+
+			if (action === "off") {
+				const hadPlan = activePlan !== null;
+				config.enabled = false;
+				activePlan = null;
+				commitState(ctx);
+				return {
+					content: [
+						{
+							type: "text",
+							text: hadPlan
+								? "Orchestrator Mode DISABLED. The active plan was cleared; published layers remain in the LayerFS store. The orch_* workflow tools are hidden again from your next agent run."
+								: "Orchestrator Mode DISABLED. The orch_* workflow tools are hidden again from your next agent run.",
+						},
+					],
+				};
+			}
+
+			const statusLines = [
+				`Orchestrator Mode: ${config.enabled ? "ON ⚡" : "OFF"}`,
+				`Subagent model: ${config.subagentModel || "inherit"} | thinking: ${config.subagentThinkingLevel || "inherit"} | max parallel: ${config.maxConcurrency} | max retries: ${config.maxRetries}`,
+				`Granted subagent skills: ${config.subagentSkills.length > 0 ? config.subagentSkills.join(", ") : "(none; workers pick up skills from the environment)"}`,
+			];
+			if (activePlan) {
+				statusLines.push(
+					`Active plan: "${activePlan.goal}" (phase ${activePlan.phase}, Wave ${activePlan.currentWaveIndex + 1}/${activePlan.waves.length})`,
+				);
+			} else {
+				statusLines.push("Active plan: (none)");
+			}
+			if (!config.enabled) {
+				statusLines.push('Turn the mode ON by calling orch_mode with action "on".');
+			}
+			return { content: [{ type: "text", text: statusLines.join("\n") }] };
+		},
+	});
+
 	const TaskSpecSchema = Type.Object({
 		id: Type.String({ description: "Short unique task ID, e.g. 'T1', 'T2'" }),
 		title: Type.String({ description: "Concise one-line title of the atomic task" }),
@@ -382,6 +523,12 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		),
 		doNotTouch: Type.Optional(
 			Type.Array(Type.String(), { description: "Files or globs the worker must never modify" }),
+		),
+		skills: Type.Optional(
+			Type.Array(Type.String(), {
+				description:
+					"Additional skill names or paths granted to this task's worker on top of the global subagentSkills config (resolved at dispatch; unresolved entries are skipped with a warning)",
+			}),
 		),
 	});
 
@@ -442,6 +589,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				acceptanceCriteria: t.acceptanceCriteria,
 				requiredTestCases: t.requiredTestCases,
 				doNotTouch: t.doNotTouch,
+				skills: t.skills ?? [],
 			}));
 
 			for (const t of normalizedTasks) {
@@ -738,6 +886,33 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				});
 			};
 
+			// Granted-skill resolution happens at dispatch time, not at plan time.
+			// Skills installed after planning still resolve, and a stale name must
+			// not stall the wave. It is skipped and surfaced in the review packet.
+			const skillRoots = skillDiscoveryRoots(ctx.cwd);
+			const globalSkillResolution = resolveGrantedSkills(config.subagentSkills, skillRoots, ctx.cwd);
+			const grantedSkillPathsByTask = new Map<string, string[]>();
+			const grantedSkillNamesByTask = new Map<string, string[]>();
+			const missingSkillNotes: string[] = [];
+			for (const missing of globalSkillResolution.missing) {
+				missingSkillNotes.push(`${missing} (global)`);
+			}
+			for (const id of targetIds) {
+				const spec = activePlan!.tasks[id].spec;
+				const requested = mergeSkillLists(
+					globalSkillResolution.resolved.map((r) => r.entry),
+					spec.skills,
+				);
+				const taskResolution = resolveGrantedSkills(requested, skillRoots, ctx.cwd);
+				grantedSkillPathsByTask.set(id, taskResolution.resolved.map((r) => r.path));
+				grantedSkillNamesByTask.set(id, taskResolution.resolved.map((r) => r.entry));
+				for (const missing of taskResolution.missing) {
+					if (globalSkillResolution.missing.includes(missing)) continue;
+					const note = `${missing} (task ${id})`;
+					if (!missingSkillNotes.includes(note)) missingSkillNotes.push(note);
+				}
+			}
+
 			await mapWithConcurrencyLimit(targetIds, config.maxConcurrency, async (id) => {
 				const record = activePlan!.tasks[id];
 				await runWaveTaskSubagent(engine, record, {
@@ -746,6 +921,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 					maxConcurrency: config.maxConcurrency,
 					signal,
 					onProgress: emitProgress,
+					skills: grantedSkillPathsByTask.get(id),
 				});
 			});
 
@@ -759,6 +935,18 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			packetSections.push(
 				`As Lead Agent, review ONLY the implementation diffs, accompanying unit test diffs, and Mechanical Gate results below, then call \`orch_review\` with your decisions.`,
 			);
+			const anyGrantedSkills = [...grantedSkillNamesByTask.values()].some(
+				(names) => names.length > 0,
+			);
+			if (anyGrantedSkills || missingSkillNotes.length > 0) {
+				const perTask = targetIds
+					.map((id) => `${id}: [${(grantedSkillNamesByTask.get(id) ?? []).join(", ")}]`)
+					.join("; ");
+				packetSections.push(`Granted skills (loaded per worker via \`pi --skill\`): ${perTask}`);
+			}
+			if (missingSkillNotes.length > 0) {
+				packetSections.push(`⚠ Unresolved skill entries skipped: ${missingSkillNotes.join("; ")}`);
+			}
 
 			for (const id of targetIds) {
 				const { spec, state } = activePlan.tasks[id];
@@ -1728,56 +1916,28 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 		};
 	});
 
-	pi.registerShortcut("ctrl+alt+o", {
-		description: "Toggle Orchestrator Mode ON/OFF",
-		handler: async (ctx) => {
-			config.enabled = !config.enabled;
-			if (!config.enabled) {
-				activePlan = null;
-			}
-			commitState(ctx);
-			ctx.ui.notify(
-				config.enabled
-					? `⚡ Orchestrator Mode ENABLED (subagent model: ${config.subagentModel || "inherit"}, thinking: ${config.subagentThinkingLevel || "inherit"})`
-					: "Orchestrator Mode DISABLED",
-				"info",
-			);
-		},
-	});
-
 	pi.registerCommand("orch", {
 		description:
-			"Configure or toggle the Lead-Subagent TDD Orchestrator (/orch [on|off|toggle|model|thinking|status|reset])",
+			"Configure the Lead-Subagent TDD Orchestrator (/orch [model|thinking|skills|status|reset]). The ON/OFF switch is the model-owned orch_mode tool; --orch bootstraps it at startup.",
 		handler: async (args, ctx) => {
 			const parts = args.trim().split(/\s+/).filter(Boolean);
 			const sub = (parts[0] || "").toLowerCase();
 
-			if (sub === "on" || sub === "enable") {
-				config.enabled = true;
-				commitState(ctx);
-				ctx.ui.notify(
-					`⚡ Orchestrator Mode ENABLED (subagent model: ${config.subagentModel || "inherit"}, thinking: ${config.subagentThinkingLevel || "inherit"})`,
-					"info",
-				);
-				return;
-			}
-
-			if (sub === "off" || sub === "disable") {
-				config.enabled = false;
-				activePlan = null;
-				commitState(ctx);
-				ctx.ui.notify("Orchestrator Mode DISABLED", "info");
-				return;
-			}
-
-			if (sub === "toggle") {
-				config.enabled = !config.enabled;
-				if (!config.enabled) activePlan = null;
-				commitState(ctx);
-				ctx.ui.notify(
-					`Orchestrator Mode ${config.enabled ? "ENABLED" : "DISABLED"}`,
-					"info",
-				);
+			if (sub === "skills" || sub === "skill") {
+				const joined = parts.slice(1).join(",");
+				if (joined) {
+					const list = /^(clear|none|off)$/i.test(joined) ? [] : parseSkillList(joined);
+					config.subagentSkills = list;
+					commitGlobalConfig(ctx, { subagentSkills: list });
+					ctx.ui.notify(
+						list.length
+							? `Subagent initial skills: ${list.join(", ")}`
+							: "Subagent initial skills cleared",
+						"info",
+					);
+					return;
+				}
+				await promptSkillSelection(ctx);
 				return;
 			}
 
@@ -1931,17 +2091,39 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 		);
 	}
 
+	/**
+	 * Edits the global grant list. Empty input clears it. The stigmergy default is
+	 * that workers pick up skills from the environment themselves, and an explicit
+	 * empty list returns to that default.
+	 */
+	async function promptSkillSelection(ctx: ExtensionContext): Promise<void> {
+		const current = config.subagentSkills.join(", ");
+		const answer = await ctx.ui.input(
+			`Initial skills granted to every subagent worker (comma-separated names or paths, empty to clear). Current: ${current || "(none)"}`,
+		);
+		if (answer === undefined) return;
+		const list = parseSkillList(answer);
+		config.subagentSkills = list;
+		commitGlobalConfig(ctx, { subagentSkills: list });
+		ctx.ui.notify(
+			list.length
+				? `Subagent initial skills: ${list.join(", ")}`
+				: "Subagent initial skills cleared",
+			"info",
+		);
+	}
+
 	async function openInteractiveOrchMenu(ctx: ExtensionContext): Promise<void> {
 		if (!ctx.hasUI) return;
 
 		const menuItems = [
-			`1. Toggle Orchestrator Workflow [Currently: ${config.enabled ? "ON ⚡" : "OFF"}]`,
-			`2. Subagent Model [Currently: ${config.subagentModel || "(inherit lead model)"}]`,
-			`3. Subagent Thinking Level [Currently: ${config.subagentThinkingLevel || "(inherit lead thinking)"}]`,
-			`4. Max Parallel Subagents [Currently: ${config.maxConcurrency}]`,
-			`5. Max Retries per Task [Currently: ${config.maxRetries}]`,
-			`6. Confirm Plan Before Dispatch [Currently: ${config.requireHumanPlanApproval ? "ON" : "OFF"}]`,
-			`7. Confirm Before Final Integration [Currently: ${config.requireHumanFinalApproval ? "ON" : "OFF"}]`,
+			`1. Subagent Model [Currently: ${config.subagentModel || "(inherit lead model)"}]`,
+			`2. Subagent Thinking Level [Currently: ${config.subagentThinkingLevel || "(inherit lead thinking)"}]`,
+			`3. Max Parallel Subagents [Currently: ${config.maxConcurrency}]`,
+			`4. Max Retries per Task [Currently: ${config.maxRetries}]`,
+			`5. Confirm Plan Before Dispatch [Currently: ${config.requireHumanPlanApproval ? "ON" : "OFF"}]`,
+			`6. Confirm Before Final Integration [Currently: ${config.requireHumanFinalApproval ? "ON" : "OFF"}]`,
+			`7. Subagent Initial Skills [Currently: ${config.subagentSkills.length > 0 ? config.subagentSkills.join(", ") : "(none)"}]`,
 			`8. Show Status & LayerFS Store Metrics`,
 			`9. Reset Active Orchestration Plan`,
 		];
@@ -1950,18 +2132,10 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 		if (!selected) return;
 
 		if (selected.startsWith("1.")) {
-			config.enabled = !config.enabled;
-			if (!config.enabled) activePlan = null;
-			commitState(ctx);
-			ctx.ui.notify(
-				`Orchestrator Workflow ${config.enabled ? "ENABLED ⚡" : "DISABLED"}`,
-				"info",
-			);
-		} else if (selected.startsWith("2.")) {
 			await promptModelSelection(ctx);
-		} else if (selected.startsWith("3.")) {
+		} else if (selected.startsWith("2.")) {
 			await promptThinkingSelection(ctx);
-		} else if (selected.startsWith("4.")) {
+		} else if (selected.startsWith("3.")) {
 			const val = await ctx.ui.input(
 				"Max Parallel Subagents (1-8)",
 				String(config.maxConcurrency),
@@ -1973,7 +2147,7 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 					ctx.ui.notify(`Max parallel subagents set to ${num}`, "info");
 				}
 			}
-		} else if (selected.startsWith("5.")) {
+		} else if (selected.startsWith("4.")) {
 			const val = await ctx.ui.input(
 				"Max Retries per Task before Escalation (0-5)",
 				String(config.maxRetries),
@@ -1985,20 +2159,22 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 					ctx.ui.notify(`Max retries per task set to ${num}`, "info");
 				}
 			}
-		} else if (selected.startsWith("6.")) {
+		} else if (selected.startsWith("5.")) {
 			config.requireHumanPlanApproval = !config.requireHumanPlanApproval;
 			commitGlobalConfig(ctx, { requireHumanPlanApproval: config.requireHumanPlanApproval });
 			ctx.ui.notify(
 				`Confirm Plan Before Dispatch: ${config.requireHumanPlanApproval ? "ON" : "OFF"}`,
 				"info",
 			);
-		} else if (selected.startsWith("7.")) {
+		} else if (selected.startsWith("6.")) {
 			config.requireHumanFinalApproval = !config.requireHumanFinalApproval;
 			commitGlobalConfig(ctx, { requireHumanFinalApproval: config.requireHumanFinalApproval });
 			ctx.ui.notify(
 				`Confirm Before Final Integration: ${config.requireHumanFinalApproval ? "ON" : "OFF"}`,
 				"info",
 			);
+		} else if (selected.startsWith("7.")) {
+			await promptSkillSelection(ctx);
 		} else if (selected.startsWith("8.")) {
 			const report = renderStatus(ctx);
 			ctx.ui.notify(report, "info");
@@ -2012,9 +2188,10 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 
 	pi.on("session_start", async (_event, ctx) => {
 		// Two precedence chains. The switch is defaults < session entry < --orch, because
-		// `enabled` must follow one session. The seven global keys are defaults <
-		// orchestrator.json < --orch-model/--orch-thinking; those flag overrides apply to
-		// this session only and are never written back into the shared file.
+		// `enabled` must follow one session (the model-owned orch_mode tool rewrites the
+		// session entry at runtime). The eight global keys are defaults < orchestrator.json
+		// < --orch-model/--orch-thinking/--orch-skills; those flag overrides apply to this
+		// session only and are never written back into the shared file.
 		const flagOverrides: Partial<OrchestratorConfig> = {};
 		if (pi.getFlag("orch") === true) {
 			flagOverrides.enabled = true;
@@ -2029,6 +2206,10 @@ MANDATORY WORKFLOW RULES (Mechanically Enforced by Tool Gates):
 			if (parsedThinking !== undefined) {
 				flagOverrides.subagentThinkingLevel = parsedThinking;
 			}
+		}
+		const flagSkills = pi.getFlag("orch-skills");
+		if (typeof flagSkills === "string" && flagSkills.trim()) {
+			flagOverrides.subagentSkills = parseSkillList(flagSkills);
 		}
 
 		const resolved = resolveSessionConfig({

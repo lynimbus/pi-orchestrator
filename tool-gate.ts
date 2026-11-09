@@ -1,8 +1,8 @@
 /**
  * The orchestrator tool-availability gate.
  *
- * Owns the decisions that keep the eight `orch_*` tools out of reach while orchestrator
- * mode is OFF. The bug it exists for: pi activated the registered tools unconditionally,
+ * Owns the decisions that keep the eight `orch_*` workflow tools out of reach while
+ * orchestrator mode is OFF. The bug it exists for: pi activated the registered tools unconditionally,
  * so a session with `"enabled": false` still declared every orch tool (and the leaked
  * "Orchestrator Mode is active" prompt guidelines) and pi executed `orch_status` when the
  * model called it.
@@ -27,6 +27,15 @@ export const ORCHESTRATOR_TOOL_NAMES: readonly string[] = [
 	"orch_status",
 ];
 
+/**
+ * The model-owned mode switch. Deliberately NOT one of the gated names above: it is
+ * always declared and never blocked, so while orchestrator mode is OFF it is the only
+ * orchestrator tool the model can reach, and the one it calls to turn the mode ON by
+ * itself. The user keeps no interactive on/off switch; only the `--orch` bootstrap
+ * flag remains.
+ */
+export const ORCHESTRATOR_MODE_TOOL_NAME = "orch_mode";
+
 const ORCHESTRATOR_TOOL_NAME_SET: ReadonlySet<string> = new Set(ORCHESTRATOR_TOOL_NAMES);
 
 export function isOrchestratorTool(name: unknown): boolean {
@@ -46,7 +55,7 @@ export function orchestratorToolGate(
 
 	return {
 		block: true,
-		reason: `Orchestrator mode is OFF for this session, so ${String(toolName)} is not available. Run /orch on to enable the Lead-Subagent workflow.`,
+		reason: `Orchestrator mode is OFF for this session, so ${String(toolName)} is not available. Call the orch_mode tool with action "on" to enable the Lead-Subagent workflow.`,
 	};
 }
 

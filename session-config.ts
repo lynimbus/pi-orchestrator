@@ -4,9 +4,9 @@
  * Two chains share this module, and only these two:
  *
  *   session switch: DEFAULT.enabled (false) <- session entry `enabled` <- --orch flag
- *   global config:  DEFAULT_ORCHESTRATOR_CONFIG <- orchestrator.json <- --orch-model / --orch-thinking
+ *   global config:  DEFAULT_ORCHESTRATOR_CONFIG <- orchestrator.json <- --orch-model / --orch-thinking / --orch-skills
  *
- * `orchestrator.json` is the agent-dir store for the seven global keys only:
+ * `orchestrator.json` is the agent-dir store for the eight global keys only:
  * `parseDefaultsFile` reads it, `serializeGlobalConfig` writes it, and it never
  * owns `enabled`. The session's `orchestrator-state` entry owns `enabled` and
  * `activePlan` only, because the master switch is the one setting that must
@@ -36,6 +36,7 @@ export const DEFAULT_ORCHESTRATOR_CONFIG: OrchestratorConfig = {
 	requireHumanPlanApproval: false,
 	requireHumanFinalApproval: false,
 	allowAutoThreeWayLineMerge: true,
+	subagentSkills: [],
 };
 
 /**
@@ -48,7 +49,7 @@ export interface OrchestratorSessionState {
 	activePlan?: OrchestrationPlan | null;
 }
 
-/** The seven settings owned by the shared defaults file. */
+/** The eight settings owned by the shared defaults file. */
 const GLOBAL_CONFIG_KEYS = [
 	"subagentModel",
 	"subagentThinkingLevel",
@@ -57,6 +58,7 @@ const GLOBAL_CONFIG_KEYS = [
 	"requireHumanPlanApproval",
 	"requireHumanFinalApproval",
 	"allowAutoThreeWayLineMerge",
+	"subagentSkills",
 ] as const;
 
 /** Every key a live config accepts, including the session-owned switch. */
@@ -99,7 +101,27 @@ function readFiniteNumber(source: Record<string, unknown>, key: string): number 
 }
 
 /**
- * Reads the agent-dir `orchestrator.json`, the store for the seven global keys.
+ * Reads a string-array key. Non-arrays yield `undefined`; an array keeps only its
+ * non-empty trimmed strings, de-duplicated in first-seen order. An explicit `[]`
+ * round-trips as `[]` so "grant nothing" stays distinguishable from "unset".
+ */
+function readStringArray(source: Record<string, unknown>, key: string): string[] | undefined {
+	const value = source[key];
+	if (!Array.isArray(value)) return undefined;
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const item of value) {
+		if (typeof item !== "string") continue;
+		const trimmed = item.trim();
+		if (!trimmed || seen.has(trimmed)) continue;
+		seen.add(trimmed);
+		out.push(trimmed);
+	}
+	return out;
+}
+
+/**
+ * Reads the agent-dir `orchestrator.json`, the store for the eight global keys.
  * Absent, unreadable or non-object content yields `undefined`; a valid object
  * with nothing usable yields `{}`. Legacy aliases (`model`, `thinkingLevel`,
  * `concurrency`) are mapped onto their canonical fields, and the canonical key
@@ -153,11 +175,16 @@ export function parseDefaultsFile(raw: string): Partial<OrchestratorConfig> | un
 		result.maxRetries = maxRetries;
 	}
 
+	const subagentSkills = readStringArray(parsed, "subagentSkills");
+	if (subagentSkills !== undefined) {
+		result.subagentSkills = subagentSkills;
+	}
+
 	return result;
 }
 
 /**
- * Serializes the seven global keys for `orchestrator.json`. `undefined` values
+ * Serializes the eight global keys for `orchestrator.json`. `undefined` values
  * are omitted rather than written as `null`, `enabled` is never written, and
  * `parseDefaultsFile` round-trips every defined value back.
  */

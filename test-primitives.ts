@@ -3,6 +3,8 @@
  *
  * - path-patterns.ts   : normalizeRelPath / hasGlobWildcard / isTestFilePath /
  *                        matchGlobPattern / matchesAnyPattern
+ * - skill-paths.ts    : parseSkillList / isPathLikeSkillEntry / skillPathCandidates /
+ *                        mergeSkillLists
  * - workspace-env.ts   : scratchDirs / ensureScratchDirs / scratchEnvironment
  * - process-runner.ts  : superviseChildProcess (timeout, abort, SIGTERM->SIGKILL,
  *                        spawn error, exactly-once settlement)
@@ -27,6 +29,12 @@ import {
 	matchesAnyPattern,
 	normalizeRelPath,
 } from "./path-patterns.ts";
+import {
+	isPathLikeSkillEntry,
+	mergeSkillLists,
+	parseSkillList,
+	skillPathCandidates,
+} from "./skill-paths.ts";
 import { KILL_ESCALATION_MS, superviseChildProcess } from "./process-runner.ts";
 import { executeWorkspaceCommand } from "./verifier.ts";
 import { ensureScratchDirs, scratchDirs, scratchEnvironment } from "./workspace-env.ts";
@@ -345,7 +353,9 @@ async function processRunnerTests(): Promise<void> {
 				// SIGKILL cannot be ignored: this only reaps a child a failed assertion left behind.
 				try {
 					proc.kill("SIGKILL");
-				} catch {}
+				} catch {
+					// Best-effort reap only. The child may already be gone by now.
+				}
 			}
 		},
 	);
@@ -541,9 +551,55 @@ async function sharedHarnessTests(): Promise<void> {
 	});
 }
 
+async function skillPathsTests(): Promise<void> {
+	console.log("skill-paths（授予 skill 的纯解析）");
+
+	await testCase("parseSkillList: 逗号/空白分隔、去空、去重、保序", () => {
+		assert.deepEqual(parseSkillList("poteto-mode, commit-style ,,poteto-mode\nverify-wave"), [
+			"poteto-mode",
+			"commit-style",
+			"verify-wave",
+		]);
+		assert.deepEqual(parseSkillList("   "), []);
+		assert.deepEqual(parseSkillList(""), []);
+	});
+
+	await testCase("isPathLikeSkillEntry: 含分隔符或 .md 结尾视为路径", () => {
+		assert.equal(isPathLikeSkillEntry("./x/y/SKILL.md"), true);
+		assert.equal(isPathLikeSkillEntry("a\\b.md"), true);
+		assert.equal(isPathLikeSkillEntry("poteto-mode"), false);
+	});
+
+	await testCase("skillPathCandidates: 裸名按根顺序探测 SKILL.md 与目录", () => {
+		assert.deepEqual(skillPathCandidates("poteto-mode", ["/r1", "/r2/"]), [
+			"/r1/poteto-mode/SKILL.md",
+			"/r1/poteto-mode",
+			"/r2/poteto-mode/SKILL.md",
+			"/r2/poteto-mode",
+		]);
+	});
+
+	await testCase("skillPathCandidates: 路径式条目原样返回、空条目为空", () => {
+		assert.deepEqual(skillPathCandidates("./x/y/SKILL.md", ["/r"]), ["./x/y/SKILL.md"]);
+		assert.deepEqual(skillPathCandidates("", ["/r"]), []);
+	});
+
+	await testCase("mergeSkillLists: 全局在前、去重、容忍 undefined", () => {
+		assert.deepEqual(mergeSkillLists(["poteto-mode", "b"], ["b", "commit-style"]), [
+			"poteto-mode",
+			"b",
+			"commit-style",
+		]);
+		assert.deepEqual(mergeSkillLists(undefined, ["x"]), ["x"]);
+		assert.deepEqual(mergeSkillLists(["x"], undefined), ["x"]);
+		assert.deepEqual(mergeSkillLists(undefined, undefined), []);
+	});
+}
+
 async function main(): Promise<void> {
 	try {
 		await pathPatternTests();
+		await skillPathsTests();
 		await workspaceEnvTests();
 		await processRunnerTests();
 		await commandRunnerOracleTests();

@@ -18,6 +18,7 @@
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import {
+	ORCHESTRATOR_MODE_TOOL_NAME,
 	ORCHESTRATOR_TOOL_NAMES,
 	declaredToolsForRun,
 	isOrchestratorTool,
@@ -98,14 +99,14 @@ function gateTests(): void {
 	console.log("orchestratorToolGate");
 
 	testCase(
-		'orchestratorToolGate("orch_status", false) blocks with a reason naming "/orch on" and the tool',
+		'orchestratorToolGate("orch_status", false) blocks with a reason naming orch_mode and the tool',
 		() => {
 			const decision = orchestratorToolGate("orch_status", false);
 			assert.notEqual(decision, undefined);
 			const block = decision as { block: true; reason: string };
 			assert.equal(block.block, true);
 			assert.equal(typeof block.reason, "string");
-			assert.match(block.reason, /\/orch on/);
+			assert.match(block.reason, /orch_mode/);
 			assert.match(block.reason, /orch_status/);
 			assert.equal(block.reason.includes("\n"), false, "the reason must be one line");
 		}
@@ -119,7 +120,7 @@ function gateTests(): void {
 				assert.notEqual(decision, undefined, name);
 				const block = decision as { block: true; reason: string };
 				assert.equal(block.block, true, name);
-				assert.match(block.reason, /\/orch on/, name);
+				assert.match(block.reason, /orch_mode/, name);
 				assert.equal(block.reason.includes(name), true, name);
 				assert.equal(block.reason.includes("\n"), false, name);
 			}

@@ -7,7 +7,7 @@
  *   session switch:  DEFAULT.enabled (false) <- session entry enabled <- --orch
  *   global config:   DEFAULT_ORCHESTRATOR_CONFIG <- orchestrator.json <- --orch-model/--orch-thinking
  *
- * The file never owns the switch, and the session entry never owns the seven
+ * The file never owns the switch, and the session entry never owns the eight
  * global keys. These tests pin both chains and the read/write round-trip of the
  * file store. Every assertion is on an observable outcome: a returned object, a
  * returned primitive, or the untouched-ness of the caller's inputs.
@@ -43,6 +43,7 @@ const EMPTY_CONFIG_VALUES: OrchestratorConfig = {
 	requireHumanPlanApproval: false,
 	requireHumanFinalApproval: false,
 	allowAutoThreeWayLineMerge: true,
+	subagentSkills: [],
 };
 
 function configWith(overrides: Partial<OrchestratorConfig>): OrchestratorConfig {
@@ -86,6 +87,7 @@ testCase(
 			requireHumanPlanApproval: false,
 			requireHumanFinalApproval: false,
 			allowAutoThreeWayLineMerge: true,
+			subagentSkills: [],
 		});
 	}
 );
@@ -99,8 +101,10 @@ testCase(
 		assert.equal(DEFAULT_ORCHESTRATOR_CONFIG.requireHumanPlanApproval, false);
 		assert.equal(DEFAULT_ORCHESTRATOR_CONFIG.requireHumanFinalApproval, false);
 		assert.equal(DEFAULT_ORCHESTRATOR_CONFIG.allowAutoThreeWayLineMerge, true);
+		assert.deepEqual(DEFAULT_ORCHESTRATOR_CONFIG.subagentSkills, []);
 		assert.ok("subagentModel" in DEFAULT_ORCHESTRATOR_CONFIG);
 		assert.ok("subagentThinkingLevel" in DEFAULT_ORCHESTRATOR_CONFIG);
+		assert.ok("subagentSkills" in DEFAULT_ORCHESTRATOR_CONFIG);
 	}
 );
 
@@ -290,7 +294,7 @@ testCase(
 );
 
 testCase(
-	"serializeGlobalConfig writes the defined seven-key store with a trailing newline",
+	"serializeGlobalConfig writes the defined eight-key store with a trailing newline",
 	() => {
 		const output = serializeGlobalConfig({
 			...DEFAULT_ORCHESTRATOR_CONFIG,
@@ -306,6 +310,7 @@ testCase(
 			requireHumanPlanApproval: false,
 			requireHumanFinalApproval: false,
 			allowAutoThreeWayLineMerge: true,
+			subagentSkills: [],
 		});
 		assert.equal("enabled" in parsed, false);
 		assert.deepEqual(parseDefaultsFile(output), {
@@ -315,6 +320,7 @@ testCase(
 			requireHumanPlanApproval: false,
 			requireHumanFinalApproval: false,
 			allowAutoThreeWayLineMerge: true,
+			subagentSkills: [],
 		});
 	}
 );
@@ -333,7 +339,7 @@ testCase(
 );
 
 testCase(
-	"serializeGlobalConfig round-trips all seven global keys and never writes enabled",
+	"serializeGlobalConfig round-trips all eight global keys and never writes enabled",
 	() => {
 		const partial: Partial<OrchestratorConfig> = {
 			enabled: true,
@@ -344,10 +350,11 @@ testCase(
 			requireHumanPlanApproval: true,
 			requireHumanFinalApproval: true,
 			allowAutoThreeWayLineMerge: false,
+			subagentSkills: ["poteto-mode", "commit-style"],
 		};
 		const output = serializeGlobalConfig(partial);
 		const parsed = parseSerialized(output);
-		assert.equal(Object.keys(parsed).length, 7, "all seven non-switch keys are present");
+		assert.equal(Object.keys(parsed).length, 8, "all eight non-switch keys are present");
 		assert.equal("enabled" in parsed, false);
 		assert.deepEqual(parseDefaultsFile(output), {
 			subagentModel: "provider/model",
@@ -357,6 +364,7 @@ testCase(
 			requireHumanPlanApproval: true,
 			requireHumanFinalApproval: true,
 			allowAutoThreeWayLineMerge: false,
+			subagentSkills: ["poteto-mode", "commit-style"],
 		});
 	}
 );
@@ -635,6 +643,7 @@ testCase(
 				requireHumanPlanApproval: true,
 				requireHumanFinalApproval: true,
 				allowAutoThreeWayLineMerge: false,
+				subagentSkills: ["poteto-mode"],
 			},
 		});
 		assert.deepEqual(config, {
@@ -646,6 +655,7 @@ testCase(
 			requireHumanPlanApproval: true,
 			requireHumanFinalApproval: true,
 			allowAutoThreeWayLineMerge: false,
+			subagentSkills: ["poteto-mode"],
 		});
 	}
 );
@@ -687,6 +697,7 @@ testCase(
 				requireHumanPlanApproval: true,
 				requireHumanFinalApproval: true,
 				allowAutoThreeWayLineMerge: false,
+				subagentSkills: ["flag-skill"],
 			},
 		});
 		assert.deepEqual(config, {
@@ -698,6 +709,7 @@ testCase(
 			requireHumanPlanApproval: true,
 			requireHumanFinalApproval: true,
 			allowAutoThreeWayLineMerge: false,
+			subagentSkills: ["flag-skill"],
 		});
 	}
 );
@@ -736,6 +748,23 @@ testCase(
 		assert.equal(resolveSessionConfig({ sessionState: { activePlan: null } }).activePlan, null);
 		assert.equal(resolveSessionConfig({ sessionState: { activePlan: undefined } }).activePlan, null);
 		assert.equal(resolveSessionConfig({}).activePlan, null);
+	}
+);
+
+testCase(
+	"resolveSessionConfig applies subagentSkills from file defaults, and flag overrides win",
+	() => {
+		const { config: fileOnly } = resolveSessionConfig({
+			fileDefaults: { subagentSkills: ["from-file"] },
+		});
+		assert.deepEqual(fileOnly.subagentSkills, ["from-file"]);
+		const { config: flagged } = resolveSessionConfig({
+			fileDefaults: { subagentSkills: ["from-file"] },
+			flagOverrides: { subagentSkills: ["from-flag"] },
+		});
+		assert.deepEqual(flagged.subagentSkills, ["from-flag"]);
+		const { config: neither } = resolveSessionConfig({});
+		assert.deepEqual(neither.subagentSkills, []);
 	}
 );
 
@@ -823,6 +852,7 @@ testCase(
 			requireHumanPlanApproval: true,
 			requireHumanFinalApproval: false,
 			allowAutoThreeWayLineMerge: true,
+			subagentSkills: [],
 		});
 	}
 );

@@ -18,6 +18,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildWorkerCliArgs } from "./subagent-runner.ts";
+import {
+	ORCHESTRATOR_MODE_TOOL_NAME,
+	ORCHESTRATOR_TOOL_NAMES,
+} from "./tool-gate.ts";
 import { createSyncTestRunner } from "./test-kit.ts";
 
 const repoRoot = path.dirname(fileURLToPath(import.meta.url));
@@ -283,9 +287,9 @@ testCase("the enabled banner is preserved, including its tool instructions", () 
 	assert.match(handler, /customType: "orchestrator-workflow-enforcement"/, "the message type must stay");
 });
 
-testCase("the eight orch tools stay registered and worker mode stays separate", () => {
+testCase("the nine orch tools stay registered and worker mode stays separate", () => {
 	const registered = indexSource.match(/pi\.registerTool\(\{/g) ?? [];
-	assert.equal(registered.length, 8, "exactly the eight orch tools must stay registered");
+	assert.equal(registered.length, 9, "the eight workflow tools plus the orch_mode switch must stay registered");
 	assert.ok(indexSource.includes("PI_ORCHESTRATOR_WORKER"), "subagent worker mode must stay wired");
 	assert.ok(
 		indexSource.includes("PI_ORCHESTRATOR_TASK_ID"),
@@ -308,7 +312,7 @@ testCase("persistState appends only the session switch and the active plan", () 
 	);
 });
 
-testCase("saveGlobalConfig writes the seven global keys with a guarded, non-throwing file write", () => {
+testCase("saveGlobalConfig writes the eight global keys with a guarded, non-throwing file write", () => {
 	const save = sliceBetween("function saveGlobalConfig(", "function commitGlobalConfig(");
 	assert.match(save, /Partial<OrchestratorConfig>/, "the writer must take a partial patch, not a whole config");
 	assert.match(save, /loadConfig\(\) \?\? \{\}/, "the patch must merge over the file's existing keys");
@@ -393,31 +397,37 @@ testCase("the eight global edit points commit through commitGlobalConfig and nev
 		{
 			label: "promptThinkingSelection",
 			start: "async function promptThinkingSelection(",
-			end: "async function openInteractiveOrchMenu(",
+			end: "async function promptSkillSelection(",
 			patchKey: /subagentThinkingLevel\s*:/,
 		},
 		{
-			label: "menu item 4 (maxConcurrency)",
-			start: 'selected.startsWith("4.")',
-			end: 'selected.startsWith("5.")',
+			label: "promptSkillSelection",
+			start: "async function promptSkillSelection(",
+			end: "async function openInteractiveOrchMenu(",
+			patchKey: /subagentSkills\s*:/,
+		},
+		{
+			label: "menu item 3 (maxConcurrency)",
+			start: 'selected.startsWith("3.")',
+			end: 'selected.startsWith("4.")',
 			patchKey: /maxConcurrency\s*:/,
 		},
 		{
-			label: "menu item 5 (maxRetries)",
-			start: 'selected.startsWith("5.")',
-			end: 'selected.startsWith("6.")',
+			label: "menu item 4 (maxRetries)",
+			start: 'selected.startsWith("4.")',
+			end: 'selected.startsWith("5.")',
 			patchKey: /maxRetries\s*:/,
 		},
 		{
-			label: "menu item 6 (requireHumanPlanApproval)",
-			start: 'selected.startsWith("6.")',
-			end: 'selected.startsWith("7.")',
+			label: "menu item 5 (requireHumanPlanApproval)",
+			start: 'selected.startsWith("5.")',
+			end: 'selected.startsWith("6.")',
 			patchKey: /requireHumanPlanApproval\s*:/,
 		},
 		{
-			label: "menu item 7 (requireHumanFinalApproval)",
-			start: 'selected.startsWith("7.")',
-			end: 'selected.startsWith("8.")',
+			label: "menu item 6 (requireHumanFinalApproval)",
+			start: 'selected.startsWith("6.")',
+			end: 'selected.startsWith("7.")',
 			patchKey: /requireHumanFinalApproval\s*:/,
 		},
 	];
@@ -435,34 +445,19 @@ testCase("the eight global edit points commit through commitGlobalConfig and nev
 testCase("the switch, reset and plan paths still commit session state", () => {
 	const switchPoints: Array<{ label: string; start: string; end: string }> = [
 		{
-			label: "/orch on",
-			start: 'if (sub === "on" || sub === "enable")',
-			end: 'if (sub === "off" || sub === "disable")',
+			label: 'orch_mode action "on"',
+			start: 'if (action === "on")',
+			end: 'if (action === "off")',
 		},
 		{
-			label: "/orch off",
-			start: 'if (sub === "off" || sub === "disable")',
-			end: 'if (sub === "toggle")',
-		},
-		{
-			label: "/orch toggle",
-			start: 'if (sub === "toggle")',
-			end: 'if (sub === "model")',
+			label: 'orch_mode action "off"',
+			start: 'if (action === "off")',
+			end: "const statusLines = [",
 		},
 		{
 			label: "/orch reset",
 			start: 'if (sub === "reset" || sub === "clear")',
 			end: 'if (sub === "status")',
-		},
-		{
-			label: "menu item 1 (toggle)",
-			start: 'selected.startsWith("1.")',
-			end: 'selected.startsWith("2.")',
-		},
-		{
-			label: "Ctrl+Alt+O shortcut",
-			start: 'pi.registerShortcut("ctrl+alt+o"',
-			end: 'pi.registerCommand("orch"',
 		},
 	];
 	for (const point of switchPoints) {
@@ -474,7 +469,7 @@ testCase("the switch, reset and plan paths still commit session state", () => {
 	}
 
 	const toolStarts = [...indexSource.matchAll(/pi\.registerTool\(\{/g)].map((match) => match.index!);
-	assert.equal(toolStarts.length, 8, "exactly the eight orch tools must stay registered");
+	assert.equal(toolStarts.length, 9, "the eight workflow tools plus the orch_mode switch must stay registered");
 	for (let i = 0; i < toolStarts.length; i++) {
 		// Bound each tool registration at the next top-level registration, otherwise the
 		// last tool would swallow the /orch command and its global-config writes.
@@ -486,7 +481,9 @@ testCase("the switch, reset and plan paths still commit session state", () => {
 		].filter((index) => index !== -1);
 		assert.ok(boundaries.length > 0, `orch tool block ${i + 1} must end before another registration`);
 		const body = indexSource.slice(toolStarts[i], Math.min(...boundaries));
-		const toolName = /name:\s*"(orch_[a-z0-9_]+)"/.exec(body)?.[1];
+		const toolName =
+			/name:\s*"(orch_[a-z0-9_]+)"/.exec(body)?.[1] ??
+			(/name:\s*ORCHESTRATOR_MODE_TOOL_NAME/.test(body) ? ORCHESTRATOR_MODE_TOOL_NAME : undefined);
 		assert.ok(toolName, `orch tool block ${i + 1} must declare its name`);
 		if (toolName !== "orch_status") {
 			// orch_status is read-only; every state-changing tool must still persist the session.
@@ -494,6 +491,68 @@ testCase("the switch, reset and plan paths still commit session state", () => {
 		}
 		assert.ok(!/commitGlobalConfig\(/.test(body), `${toolName} must not write global config`);
 	}
+});
+
+testCase("the user-facing on/off switches are gone: the switch belongs to the model", () => {
+	assert.ok(!indexSource.includes('sub === "on"'), "/orch on must stay removed");
+	assert.ok(!indexSource.includes('sub === "off"'), "/orch off must stay removed");
+	assert.ok(!indexSource.includes('sub === "toggle"'), "/orch toggle must stay removed");
+	assert.ok(!indexSource.includes("registerShortcut("), "the Ctrl+Alt+O shortcut must stay removed");
+	assert.ok(!indexSource.includes("Ctrl+Alt+O"), "no shortcut may be documented in the header");
+	assert.ok(!indexSource.includes("Toggle Orchestrator"), "the menu must not offer a toggle item");
+});
+
+testCase("orch_mode is the model-owned switch: registered, always reachable, never gated", () => {
+	assert.match(
+		indexSource,
+		/import\s*\{[^}]*ORCHESTRATOR_MODE_TOOL_NAME[^}]*\}\s*from\s*"\.\/tool-gate\.ts"/,
+		"ORCHESTRATOR_MODE_TOOL_NAME must come from ./tool-gate.ts (single source of truth)",
+	);
+	assert.ok(
+		indexSource.includes("name: ORCHESTRATOR_MODE_TOOL_NAME"),
+		"the switch tool must be registered under ORCHESTRATOR_MODE_TOOL_NAME",
+	);
+	assert.equal(
+		ORCHESTRATOR_TOOL_NAMES.includes(ORCHESTRATOR_MODE_TOOL_NAME),
+		false,
+		"the switch must NOT be one of the gated names: it stays reachable while OFF",
+	);
+	const block = windowFrom("name: ORCHESTRATOR_MODE_TOOL_NAME", 4600);
+	assert.match(block, /StringEnum\(\["on", "off", "status"\]/, "the switch must accept on/off/status");
+	assert.match(block, /commitState\(ctx\)/, "switching must persist through the session entry");
+	assert.match(block, /config\.subagentSkills/, "the status report must surface the granted-skill list");
+});
+
+testCase("orch_dispatch resolves granted skills per task and hands them to the workers", () => {
+	assert.match(
+		indexSource,
+		/import\s*\{[^}]*skillPathCandidates[^}]*\}\s*from\s*"\.\/skill-paths\.ts"/,
+		"skillPathCandidates must come from ./skill-paths.ts",
+	);
+	const dispatch = windowFrom("const skillRoots = skillDiscoveryRoots(ctx.cwd)", 1700);
+	assert.match(dispatch, /resolveGrantedSkills\(/, "entries must resolve against the discovery roots");
+	assert.match(dispatch, /mergeSkillLists\(/, "global and per-task grants must merge, deduplicated");
+	assert.match(
+		dispatch,
+		/skills:\s*grantedSkillPathsByTask\.get\(id\)/,
+		"the resolved paths must reach runWaveTaskSubagent",
+	);
+	const packet = windowFrom("const anyGrantedSkills", 700);
+	assert.match(
+		packet,
+		/Granted skills \(loaded per worker via/,
+		"the granted list must be surfaced for review",
+	);
+	assert.match(
+		packet,
+		/Unresolved skill entries skipped/,
+		"missing entries must be surfaced in the packet, never fatal",
+	);
+});
+
+testCase("the TaskSpec schema carries an optional per-task skills grant", () => {
+	const schema = windowFrom("const TaskSpecSchema = Type.Object({", 2000);
+	assert.match(schema, /skills:\s*Type\.Optional\(/, "tasks may grant extra skills on top of the global list");
 });
 
 testCase("session_start resolves through resolveSessionConfig with readSessionState", () => {
@@ -552,6 +611,16 @@ testCase("the --orch-thinking flag description derives its levels from the model
 });
 
 console.log("/orch thinking follows the model declaration");
+
+testCase("--orch-skills seeds the flag override layer through parseSkillList", () => {
+	assert.ok(
+		indexSource.includes('pi.registerFlag("orch-skills"'),
+		"the --orch-skills flag must be registered",
+	);
+	const flagSkills = windowFrom('pi.getFlag("orch-skills")', 260);
+	assert.match(flagSkills, /parseSkillList\(/, "the value must be parsed through the shared list parser");
+	assert.match(flagSkills, /flagOverrides\.subagentSkills\s*=/, "the parsed list must seed the flag override layer");
+});
 
 testCase("an unsupported level is rejected with unsupportedThinkingLevelMessage and never persisted", () => {
 	const thinking = windowFrom('sub === "thinking"', 1400);

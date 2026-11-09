@@ -37,6 +37,12 @@ export interface SubagentDispatchOptions {
 	 * an empty string disables the variable entirely.
 	 */
 	cacheRetention?: string;
+	/**
+	 * Resolved skill paths granted to this task's worker. The global `subagentSkills`
+	 * config plus the task spec's own list, already resolved by the lead at dispatch
+	 * time. Passed through as `--skill <path>` pairs, so retries stay byte-identical.
+	 */
+	skills?: string[];
 }
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
@@ -79,6 +85,8 @@ export function workerSessionDir(workspacePath: string): string {
 export interface WorkerCliOptions {
 	model?: string;
 	thinkingLevel?: string;
+	/** Resolved skill paths granted to the worker; each becomes one `--skill <path>` pair. */
+	skills?: readonly string[];
 }
 
 export interface WorkerCliResult {
@@ -117,6 +125,9 @@ export function buildWorkerCliArgs(
 	}
 	if (opts.thinkingLevel) {
 		args.push("--thinking", opts.thinkingLevel);
+	}
+	for (const skillPath of opts.skills ?? []) {
+		args.push("--skill", skillPath);
 	}
 
 	return { args, sessionDir };
@@ -465,6 +476,7 @@ export async function runWaveTaskSubagent(
 	const workerCli = buildWorkerCliArgs(spec.id, sessionDir, {
 		model: options.model,
 		thinkingLevel: options.thinkingLevel,
+		skills: options.skills,
 	});
 	const cliArgs = workerCli.args;
 	// The system prompt file is a runtime artifact, so it is appended here rather

@@ -39,6 +39,12 @@ export interface OrchestratorConfig {
 	requireHumanFinalApproval: boolean;
 	/** Allow 3-way non-overlapping line merge when two tasks touch different regions of the same file */
 	allowAutoThreeWayLineMerge: boolean;
+	/**
+	 * Skill names (or paths) granted to EVERY subagent worker at spawn, on top of the
+	 * worker's own skill discovery. Exists for skills that discovery cannot surface on
+	 * its own (e.g. `disable-model-invocation: true` skills like poteto-mode).
+	 */
+	subagentSkills: string[];
 }
 
 export interface RequiredTestCase {
@@ -65,6 +71,12 @@ export interface TaskSpec {
 	requiredTestCases: RequiredTestCase[];
 	/** Optional explicit forbidden paths or patterns */
 	doNotTouch?: string[];
+	/**
+	 * Additional skill names (or paths) granted to this task's worker on top of the
+	 * global `subagentSkills` config. Resolved at dispatch time; entries that resolve
+	 * to nothing are skipped with a warning in the review packet instead of failing.
+	 */
+	skills?: string[];
 }
 
 export interface UsageStats {

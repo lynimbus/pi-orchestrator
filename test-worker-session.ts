@@ -181,6 +181,30 @@ async function cliArgsTests(): Promise<void> {
 	});
 
 	await testCase(
+		"skills 依序追加为逐个 --skill <path> 对",
+		() => {
+			const { args } = buildWorkerCliArgs("t5", "/ws/task-t5/sessions", {
+				skills: ["/agent/skills/poteto-mode/SKILL.md", "/repo/.agents/skills/commit-style"],
+			});
+
+			const firstSkill = args.indexOf("--skill");
+			assert.notEqual(firstSkill, -1, "args must contain --skill");
+			assert.deepEqual(args.slice(firstSkill, firstSkill + 4), [
+				"--skill",
+				"/agent/skills/poteto-mode/SKILL.md",
+				"--skill",
+				"/repo/.agents/skills/commit-style",
+			]);
+		},
+		"contract: 每个授予 skill 一个 --skill <path> 对，顺序保持",
+	);
+
+	await testCase("未授予 skill 时不含 --skill 旗标", () => {
+		const { args } = baseCliArgs();
+		assert.equal(args.includes("--skill"), false);
+	});
+
+	await testCase(
 		"attempt #2 起复用同一 sessionDir 与 session-id, 无需额外恢复参数",
 		() => {
 			const first = buildWorkerCliArgs("t5", "/ws/task-t5/sessions", { model: "m/x" });
